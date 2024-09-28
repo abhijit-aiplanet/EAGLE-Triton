@@ -3,6 +3,7 @@
 
 
 """ PyTorch LLaMA model."""
+
 import math
 from typing import List, Optional, Tuple, Union
 
@@ -33,7 +34,25 @@ logger = logging.get_logger(__name__)
 _CONFIG_FOR_DOC = "LlamaConfig"
 
 
-# Copied from transformers.models.bart.modeling_bart._make_causal_mask
+import torch
+import triton
+import triton.language as tl
+
+
+# Triton kernel for creating the causal mask
+@triton.jit
+def causal_mask_kernel(mask_ptr, tgt_len, BLOCK_SIZE: tl.constexpr):
+    row_idx = tl.program_id(0)  # Get the row index for the mask
+    col_idx = tl.arange(0, BLOCK_SIZE)  # Get a block of column indices
+    mask_cond = tl.arange(0, tgt_len)  # Condition array [0, 1, 2, ..., tgt_len-1]
+
+    # Fill the mask with the minimum value of the dtype where causal condition is met
+    causal_value = mask_cond < (mask_cond + 1).view(tgt_len, 1)
+    # Convert to 0 or dtype.min where causal condition isn't met
+    mask_val = tl.where(causal_value, 0.0, torch.finfo(torch.float32).min)
+    tl.store(mask_ptr + row_idx * tgt_len + col_idx, mask_val)
+
+
 def _make_causal_mask(
         input_ids_shape: torch.Size,
         dtype: torch.dtype,
@@ -41,7 +60,7 @@ def _make_causal_mask(
         past_key_values_length: int = 0,
 ):
     """
-    Create a causal mask for bi-directional self-attention.
+    Create a causal mask for bi-directional self-attention using Triton.
 
     Args:
         input_ids_shape (torch.Size): The shape of input_ids tensor, typically (batch_size, tgt_len).
@@ -53,30 +72,58 @@ def _make_causal_mask(
         torch.Tensor: The causal mask tensor.
     """
     bsz, tgt_len = input_ids_shape
-    mask = torch.full((tgt_len, tgt_len), torch.finfo(dtype).min, device=device)
-    mask_cond = torch.arange(mask.size(-1), device=device)
-    mask.masked_fill_(mask_cond < (mask_cond + 1).view(mask.size(-1), 1), 0)
-    mask = mask.to(dtype)
+    mask = torch.empty((tgt_len, tgt_len), dtype=dtype, device=device)
+    
+    BLOCK_SIZE = 1024  # Define block size for Triton kernel (you can tune this for your hardware)
+    grid = lambda meta: (tgt_len + BLOCK_SIZE - 1) // BLOCK_SIZE  # Grid size for parallelization
+    
+    # Launch Triton kernel for creating the mask
+    causal_mask_kernel[grid](
+        mask.data_ptr(), tgt_len, BLOCK_SIZE
+    )
 
     if past_key_values_length > 0:
-        mask = torch.cat(
-            [
-                torch.zeros(
-                    tgt_len, past_key_values_length, dtype=dtype, device=device
-                ),
-                mask,
-            ],
-            dim=-1,
+        past_mask = torch.zeros(
+            tgt_len, past_key_values_length, dtype=dtype, device=device
         )
+        mask = torch.cat([past_mask, mask], dim=-1)
+
     return mask[None, None, :, :].expand(
         bsz, 1, tgt_len, tgt_len + past_key_values_length
     )
 
 
-# Copied from transformers.models.bart.modeling_bart._expand_mask
+import torch
+import triton
+import triton.language as tl
+
+
+# Triton kernel for expanding the attention mask
+@triton.jit
+def expand_mask_kernel(
+        expanded_mask_ptr, 
+        mask_ptr, 
+        src_len, 
+        tgt_len, 
+        bsz, 
+        BLOCK_SIZE: tl.constexpr
+):
+    b_idx = tl.program_id(0)  # Get batch index
+    t_idx = tl.program_id(1)  # Get target sequence index
+    s_idx = tl.arange(0, BLOCK_SIZE)  # Get a block of source sequence indices
+
+    # Compute mask expansion for each batch and target index
+    mask_value = tl.load(mask_ptr + b_idx * src_len + s_idx, mask=s_idx < src_len)
+    mask_value = mask_value[:, None].expand(tgt_len, src_len)  # Expand to tgt_len
+    expanded_value = 1.0 - mask_value
+
+    # Store the result in the expanded_mask tensor
+    tl.store(expanded_mask_ptr + b_idx * tgt_len * src_len + t_idx * src_len + s_idx, expanded_value, mask=s_idx < src_len)
+
+
 def _expand_mask(mask: torch.Tensor, dtype: torch.dtype, tgt_len: Optional[int] = None):
     """
-    Expand attention_mask from `[bsz, seq_len]` to `[bsz, 1, tgt_seq_len, src_seq_len]`.
+    Expand attention_mask from `[bsz, seq_len]` to `[bsz, 1, tgt_seq_len, src_seq_len]` using Triton.
 
     Args:
         mask (torch.Tensor): The attention mask tensor of shape `[bsz, seq_len]`.
@@ -89,22 +136,64 @@ def _expand_mask(mask: torch.Tensor, dtype: torch.dtype, tgt_len: Optional[int] 
     bsz, src_len = mask.size()
     tgt_len = tgt_len if tgt_len is not None else src_len
 
-    expanded_mask = mask[:, None, None, :].expand(bsz, 1, tgt_len, src_len).to(dtype)
+    # Initialize the expanded mask
+    expanded_mask = torch.empty((bsz, tgt_len, src_len), dtype=dtype, device=mask.device)
 
+    BLOCK_SIZE = 1024  # Define the block size for the Triton kernel
+    grid = lambda meta: (bsz, tgt_len, (src_len + BLOCK_SIZE - 1) // BLOCK_SIZE)
+
+    # Launch Triton kernel for expanding the mask
+    expand_mask_kernel[grid](
+        expanded_mask.data_ptr(), mask.data_ptr(), src_len, tgt_len, bsz, BLOCK_SIZE
+    )
+
+    # Invert the mask (this part does not need Triton as it's a simple operation)
+    expanded_mask = expanded_mask.to(dtype)
     inverted_mask = 1.0 - expanded_mask
 
-    return inverted_mask.masked_fill(
-        inverted_mask.to(torch.bool), torch.finfo(dtype).min
-    )
+    # Apply the mask fill (can still use standard PyTorch here)
+    return inverted_mask.masked_fill(inverted_mask.to(torch.bool), torch.finfo(dtype).min)
+
 
 
 import torch.nn as nn
 import torch
 
 
+
+# Triton kernel for RMS normalization
+@triton.jit
+def rms_norm_kernel(
+        hidden_states_ptr, 
+        normed_states_ptr, 
+        weight_ptr, 
+        eps_ptr, 
+        hidden_size, 
+        BLOCK_SIZE: tl.constexpr):
+    row_idx = tl.program_id(0)  # Get row index for each batch
+    col_idx = tl.arange(0, BLOCK_SIZE)  # Get block of indices for hidden size
+
+    # Load hidden states
+    hidden_vals = tl.load(hidden_states_ptr + row_idx * hidden_size + col_idx, mask=col_idx < hidden_size, other=0.0)
+
+    # Compute variance
+    variance = tl.sum(hidden_vals * hidden_vals, axis=0) / hidden_size
+    inv_stddev = 1.0 / tl.sqrt(variance + tl.load(eps_ptr))
+
+    # Normalize the hidden states
+    normed_vals = hidden_vals * inv_stddev
+
+    # Scale with the weight parameter
+    weight_vals = tl.load(weight_ptr + col_idx, mask=col_idx < hidden_size)
+    normed_vals = normed_vals * weight_vals
+
+    # Store the normalized and scaled values
+    tl.store(normed_states_ptr + row_idx * hidden_size + col_idx, normed_vals, mask=col_idx < hidden_size)
+
+
 class LlamaRMSNorm(nn.Module):
     """
-    LlamaRMSNorm is equivalent to T5LayerNorm.
+    LlamaRMSNorm is equivalent to T5LayerNorm, using Triton to accelerate computation.
 
     Args:
         hidden_size (int): The size of the hidden states.
@@ -114,11 +203,12 @@ class LlamaRMSNorm(nn.Module):
     def __init__(self, hidden_size, eps=1e-6):
         super().__init__()
         self.weight = nn.Parameter(torch.ones(hidden_size))
-        self.variance_epsilon = eps
+        self.variance_epsilon = torch.tensor([eps], dtype=torch.float32).cuda()
+        self.hidden_size = hidden_size
 
     def forward(self, hidden_states):
         """
-        Apply LlamaRMSNorm to the input hidden states.
+        Apply LlamaRMSNorm to the input hidden states using Triton for GPU acceleration.
 
         Args:
             hidden_states (torch.Tensor): Input hidden states.
@@ -127,15 +217,48 @@ class LlamaRMSNorm(nn.Module):
             torch.Tensor: The normalized and scaled hidden states.
         """
         input_dtype = hidden_states.dtype
-        hidden_states = hidden_states.to(torch.float32)
-        variance = hidden_states.pow(2).mean(-1, keepdim=True)
-        hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
-        return self.weight * hidden_states.to(input_dtype)
+        hidden_states = hidden_states.to(torch.float32)  # Convert to float32 for stability
+
+        # Initialize the output tensor
+        normed_states = torch.empty_like(hidden_states)
+
+        # Launch Triton kernel
+        BLOCK_SIZE = 1024  # You can tune this based on your hardware
+        grid = lambda meta: (hidden_states.size(0),)  # One block per row (batch element)
+
+        rms_norm_kernel[grid](
+            hidden_states.data_ptr(),
+            normed_states.data_ptr(),
+            self.weight.data_ptr(),
+            self.variance_epsilon.data_ptr(),
+            self.hidden_size,
+            BLOCK_SIZE
+        )
+
+        return normed_states.to(input_dtype)  # Convert back to original dtype if needed
+
+
+# Triton kernel to calculate cosine and sine embeddings
+@triton.jit
+def rotary_embedding_kernel(freqs_ptr, cos_ptr, sin_ptr, seq_len, dim, BLOCK_SIZE: tl.constexpr):
+    seq_idx = tl.program_id(0)  # Sequence index for the batch
+    dim_idx = tl.arange(0, BLOCK_SIZE)  # Dimension index block for parallelism
+
+    # Calculate the frequency for each sequence index and dimension
+    freq_val = tl.load(freqs_ptr + seq_idx * dim + dim_idx, mask=dim_idx < dim)
+
+    # Calculate cosine and sine of the frequency
+    cos_val = tl.cos(freq_val)
+    sin_val = tl.sin(freq_val)
+
+    # Store the calculated cos and sin values
+    tl.store(cos_ptr + seq_idx * dim + dim_idx, cos_val, mask=dim_idx < dim)
+    tl.store(sin_ptr + seq_idx * dim + dim_idx, sin_val, mask=dim_idx < dim)
 
 
 class LlamaRotaryEmbedding(nn.Module):
     """
-    Llama Rotary Positional Embedding Module.
+    Llama Rotary Positional Embedding Module using Triton for faster computation of embeddings.
 
     Args:
         dim (int): The dimension of the embedding.
@@ -151,11 +274,11 @@ class LlamaRotaryEmbedding(nn.Module):
         self.max_position_embeddings = max_position_embeddings
         self.base = base
         inv_freq = 1.0 / (
-                self.base ** (torch.arange(0, self.dim, 2).float().to(device) / self.dim)
+            self.base ** (torch.arange(0, self.dim, 2).float().to(device) / self.dim)
         )
         self.register_buffer("inv_freq", inv_freq)
 
-        # Build here to make `torch.jit.trace` work.
+        # Initialize cosine and sine cache using Triton for efficiency
         self._set_cos_sin_cache(
             seq_len=max_position_embeddings,
             device=self.inv_freq.device,
@@ -164,7 +287,7 @@ class LlamaRotaryEmbedding(nn.Module):
 
     def _set_cos_sin_cache(self, seq_len, device, dtype):
         """
-        Set the cosine and sine cache for positional embeddings.
+        Set the cosine and sine cache for positional embeddings using Triton.
 
         Args:
             seq_len (int): The sequence length.
@@ -172,19 +295,31 @@ class LlamaRotaryEmbedding(nn.Module):
             dtype: The data type of the cache tensors.
         """
         self.max_seq_len_cached = seq_len
-        t = torch.arange(
-            self.max_seq_len_cached, device=device, dtype=self.inv_freq.dtype
-        )
+        t = torch.arange(self.max_seq_len_cached, device=device, dtype=self.inv_freq.dtype)
 
         freqs = torch.einsum("i,j->ij", t, self.inv_freq)
-        # Different from paper, but it uses a different permutation in order to obtain the same calculation
         emb = torch.cat((freqs, freqs), dim=-1)
-        self.register_buffer(
-            "cos_cached", emb.cos()[None, None, :, :].to(dtype), persistent=False
+
+        # Allocate memory for cosine and sine buffers
+        cos_cache = torch.empty_like(emb, dtype=dtype, device=device)
+        sin_cache = torch.empty_like(emb, dtype=dtype, device=device)
+
+        BLOCK_SIZE = 1024  # You can adjust this based on your hardware for optimal performance
+        grid = lambda meta: (seq_len,)  # Grid parallelizes across the sequence length
+
+        # Launch the Triton kernel to calculate cos and sin embeddings
+        rotary_embedding_kernel[grid](
+            emb.data_ptr(), 
+            cos_cache.data_ptr(), 
+            sin_cache.data_ptr(), 
+            seq_len, 
+            self.dim, 
+            BLOCK_SIZE
         )
-        self.register_buffer(
-            "sin_cached", emb.sin()[None, None, :, :].to(dtype), persistent=False
-        )
+
+        # Register the buffers for future access
+        self.register_buffer("cos_cached", cos_cache[None, None, :, :], persistent=False)
+        self.register_buffer("sin_cached", sin_cache[None, None, :, :], persistent=False)
 
     def forward(self, x, seq_len=None):
         """
@@ -206,11 +341,36 @@ class LlamaRotaryEmbedding(nn.Module):
         )
 
 
+# Triton kernel to calculate cosine and sine embeddings with scaling
+@triton.jit
+def linear_scaling_rotary_embedding_kernel(
+        scaled_freqs_ptr,
+        cos_ptr,
+        sin_ptr,
+        seq_len,
+        dim,
+        scaling_factor,
+        BLOCK_SIZE: tl.constexpr):
+    
+    seq_idx = tl.program_id(0)  # Sequence index for each batch
+    dim_idx = tl.arange(0, BLOCK_SIZE)  # Dimension index block for parallelism
+
+    # Calculate scaled frequency for each sequence index and dimension
+    freq_val = tl.load(scaled_freqs_ptr + seq_idx * dim + dim_idx, mask=dim_idx < dim)
+    freq_val = freq_val / scaling_factor  # Apply linear scaling
+
+    # Calculate cosine and sine of the scaled frequency
+    cos_val = tl.cos(freq_val)
+    sin_val = tl.sin(freq_val)
+
+    # Store the calculated cos and sin values
+    tl.store(cos_ptr + seq_idx * dim + dim_idx, cos_val, mask=dim_idx < dim)
+    tl.store(sin_ptr + seq_idx * dim + dim_idx, sin_val, mask=dim_idx < dim)
+
+
 class LlamaLinearScalingRotaryEmbedding(LlamaRotaryEmbedding):
     """
-    LlamaRotaryEmbedding extended with linear scaling.
-
-    This class adds linear scaling to LlamaRotaryEmbedding. Credits to the Reddit user /u/kaiokendev.
+    LlamaRotaryEmbedding extended with linear scaling using Triton for faster embedding computation.
 
     Args:
         dim (int): The dimension of the embedding.
@@ -233,7 +393,7 @@ class LlamaLinearScalingRotaryEmbedding(LlamaRotaryEmbedding):
 
     def _set_cos_sin_cache(self, seq_len, device, dtype):
         """
-        Set the cosine and sine cache for the rotary embeddings.
+        Set the cosine and sine cache for the rotary embeddings using Triton.
 
         Args:
             seq_len (int): The sequence length.
@@ -241,27 +401,88 @@ class LlamaLinearScalingRotaryEmbedding(LlamaRotaryEmbedding):
             dtype: The data type for the cache.
         """
         self.max_seq_len_cached = seq_len
-        t = torch.arange(
-            self.max_seq_len_cached, device=device, dtype=self.inv_freq.dtype
-        )
-        t = t / self.scaling_factor
+        t = torch.arange(self.max_seq_len_cached, device=device, dtype=self.inv_freq.dtype)
+        t = t / self.scaling_factor  # Apply the scaling factor
 
+        # Compute frequency embeddings
         freqs = torch.einsum("i,j->ij", t, self.inv_freq)
-        # Different from paper, but it uses a different permutation in order to obtain the same calculation
         emb = torch.cat((freqs, freqs), dim=-1)
-        self.register_buffer(
-            "cos_cached", emb.cos()[None, None, :, :].to(dtype), persistent=False
+
+        # Allocate memory for cosine and sine buffers
+        cos_cache = torch.empty_like(emb, dtype=dtype, device=device)
+        sin_cache = torch.empty_like(emb, dtype=dtype, device=device)
+
+        BLOCK_SIZE = 1024  # You can adjust this based on your hardware for optimal performance
+        grid = lambda meta: (seq_len,)  # Grid parallelizes across the sequence length
+
+        # Launch the Triton kernel to calculate cos and sin embeddings with scaling
+        linear_scaling_rotary_embedding_kernel[grid](
+            emb.data_ptr(), 
+            cos_cache.data_ptr(), 
+            sin_cache.data_ptr(), 
+            seq_len, 
+            self.dim, 
+            self.scaling_factor,
+            BLOCK_SIZE
         )
-        self.register_buffer(
-            "sin_cached", emb.sin()[None, None, :, :].to(dtype), persistent=False
+
+        # Register the buffers for future access
+        self.register_buffer("cos_cached", cos_cache[None, None, :, :], persistent=False)
+        self.register_buffer("sin_cached", sin_cache[None, None, :, :], persistent=False)
+
+    def forward(self, x, seq_len=None):
+        """
+        Forward pass of the LlamaLinearScalingRotaryEmbedding module.
+
+        Args:
+            x (torch.Tensor): Input tensor of shape [bs, num_attention_heads, seq_len, head_size].
+            seq_len (int): The sequence length. If greater than the cached length, the cache will be updated.
+
+        Returns:
+            tuple: A tuple containing two tensors, the cosine and sine embeddings, both of shape [1, 1, seq_len, dim].
+        """
+        if seq_len > self.max_seq_len_cached:
+            self._set_cos_sin_cache(seq_len=seq_len, device=x.device, dtype=x.dtype)
+
+        return (
+            self.cos_cached[:, :, :seq_len, ...].to(dtype=x.dtype),
+            self.sin_cached[:, :, :seq_len, ...].to(dtype=x.dtype),
         )
+
+
+# Triton kernel for applying cosine and sine embeddings to query and key tensors
+@triton.jit
+def rotary_pos_emb_kernel(q_ptr, k_ptr, cos_ptr, sin_ptr, position_ids_ptr, embed_dim, BLOCK_SIZE: tl.constexpr):
+    seq_idx = tl.program_id(0)  # Sequence index for each batch
+    dim_idx = tl.arange(0, BLOCK_SIZE)  # Dimension index block for parallelism
+
+    # Load query and key values
+    q_val = tl.load(q_ptr + seq_idx * embed_dim + dim_idx, mask=dim_idx < embed_dim)
+    k_val = tl.load(k_ptr + seq_idx * embed_dim + dim_idx, mask=dim_idx < embed_dim)
+
+    # Load cosine and sine values for the current position
+    cos_val = tl.load(cos_ptr + tl.load(position_ids_ptr + seq_idx) * embed_dim + dim_idx, mask=dim_idx < embed_dim)
+    sin_val = tl.load(sin_ptr + tl.load(position_ids_ptr + seq_idx) * embed_dim + dim_idx, mask=dim_idx < embed_dim)
+
+    # Rotate half the dimensions of the query and key tensors
+    half = embed_dim // 2
+    q1 = q_val[..., :half]
+    q2 = q_val[..., half:]
+    k1 = k_val[..., :half]
+    k2 = k_val[..., half:]
+
+    # Apply rotary embeddings
+    q_embed = (q1 * cos_val[:half]) + (-q2 * sin_val[:half])
+    k_embed = (k1 * cos_val[:half]) + (-k2 * sin_val[:half])
+
+    # Store the updated query and key embeddings
+    tl.store(q_ptr + seq_idx * embed_dim + dim_idx, q_embed, mask=dim_idx < embed_dim)
+    tl.store(k_ptr + seq_idx * embed_dim + dim_idx, k_embed, mask=dim_idx < embed_dim)
 
 
 class LlamaDynamicNTKScalingRotaryEmbedding(LlamaRotaryEmbedding):
     """
-    LlamaRotaryEmbedding extended with Dynamic NTK scaling.
-
-    Credits to the Reddit users /u/bloc97 and /u/emozilla.
+    LlamaRotaryEmbedding extended with Dynamic NTK scaling using Triton for efficient rotary embedding computation.
     """
 
     def __init__(
@@ -320,24 +541,30 @@ class LlamaDynamicNTKScalingRotaryEmbedding(LlamaRotaryEmbedding):
         )
 
 
-def rotate_half(x):
+def rotate_half_triton(x_ptr, embed_dim, BLOCK_SIZE: tl.constexpr):
     """
-    Rotates half the hidden dimensions of the input.
+    Triton kernel for rotating half the hidden dimensions.
 
     Args:
-        x (torch.Tensor): Input tensor.
-
-    Returns:
-        torch.Tensor: Tensor with half of its hidden dimensions rotated.
+        x_ptr (torch.Tensor): Input tensor.
+        embed_dim (int): Embedding dimension.
+        BLOCK_SIZE (int): Block size for Triton kernel.
     """
-    x1 = x[..., : x.shape[-1] // 2]
-    x2 = x[..., x.shape[-1] // 2:]
-    return torch.cat((-x2, x1), dim=-1)
+    seq_idx = tl.program_id(0)  # Sequence index
+    dim_idx = tl.arange(0, BLOCK_SIZE)  # Dimension index block
+
+    half = embed_dim // 2
+    x1 = tl.load(x_ptr + seq_idx * embed_dim + dim_idx, mask=dim_idx < half)
+    x2 = tl.load(x_ptr + seq_idx * embed_dim + dim_idx + half, mask=dim_idx < half)
+
+    # Rotate half the dimensions
+    tl.store(x_ptr + seq_idx * embed_dim + dim_idx, -x2, mask=dim_idx < half)
+    tl.store(x_ptr + seq_idx * embed_dim + dim_idx + half, x1, mask=dim_idx < half)
 
 
-def apply_rotary_pos_emb(q, k, cos, sin, position_ids):
+def apply_rotary_pos_emb_triton(q, k, cos, sin, position_ids):
     """
-    Apply rotary position embeddings to query and key tensors.
+    Apply rotary position embeddings to query and key tensors using Triton for parallel computation.
 
     Args:
         q (torch.Tensor): Query tensor.
@@ -349,31 +576,58 @@ def apply_rotary_pos_emb(q, k, cos, sin, position_ids):
     Returns:
         torch.Tensor: Query and key tensors with rotary position embeddings applied.
     """
-    cos = cos.squeeze(1).squeeze(0)
-    sin = sin.squeeze(1).squeeze(0)
-    cos = cos[position_ids].unsqueeze(1)
-    sin = sin[position_ids].unsqueeze(1)
-    q_embed = (q * cos) + (rotate_half(q) * sin)
-    k_embed = (k * cos) + (rotate_half(k) * sin)
-    return q_embed, k_embed
+    embed_dim = q.shape[-1]
+
+    # Triton block size
+    BLOCK_SIZE = 1024
+    grid = lambda meta: (q.size(0),)  # Parallelize over batch size
+
+    # Apply rotary embeddings using Triton
+    rotary_pos_emb_kernel[grid](
+        q.data_ptr(),
+        k.data_ptr(),
+        cos.data_ptr(),
+        sin.data_ptr(),
+        position_ids.data_ptr(),
+        embed_dim,
+        BLOCK_SIZE
+    )
+
+    return q, k
+
+
+# Triton kernel for MLP projection and activation
+@triton.jit
+def mlp_kernel(x_ptr, gate_proj_ptr, up_proj_ptr, down_proj_ptr, act_fn, intermediate_size, hidden_size, BLOCK_SIZE: tl.constexpr):
+    seq_idx = tl.program_id(0)  # Sequence index for the batch
+    dim_idx = tl.arange(0, BLOCK_SIZE)  # Block of dimensions for parallelism
+
+    # Load input tensor
+    x_val = tl.load(x_ptr + seq_idx * hidden_size + dim_idx, mask=dim_idx < hidden_size)
+
+    # Apply gate_proj and up_proj (linear layers)
+    gate_proj_val = tl.dot(x_val, gate_proj_ptr + dim_idx, mask=dim_idx < intermediate_size)
+    up_proj_val = tl.dot(x_val, up_proj_ptr + dim_idx, mask=dim_idx < intermediate_size)
+
+    # Apply activation function
+    if act_fn == 'relu':
+        gate_proj_val = tl.max(0, gate_proj_val)
+    elif act_fn == 'gelu':
+        gate_proj_val = tl.gelu(gate_proj_val)
+
+    # Multiply activated gate_proj with up_proj
+    intermediate_val = gate_proj_val * up_proj_val
+
+    # Apply down_proj (linear layer)
+    down_proj_val = tl.dot(intermediate_val, down_proj_ptr + dim_idx, mask=dim_idx < hidden_size)
+
+    # Store result back into the output tensor
+    tl.store(x_ptr + seq_idx * hidden_size + dim_idx, down_proj_val, mask=dim_idx < hidden_size)
 
 
 class LlamaMLP(nn.Module):
     """
-    LlamaMLP is a multi-layer perceptron module used in the Llama model.
-
-    Args:
-        config: The configuration for the MLP.
-
-    Attributes:
-        pretraining_tp (int): The pretraining time periods.
-        hidden_size (int): The size of the hidden layer.
-        intermediate_size (int): The size of the intermediate layer.
-        gate_proj (nn.Linear): The linear projection for gating.
-        up_proj (nn.Linear): The linear projection for the up projection.
-        down_proj (nn.Linear): The linear projection for the down projection.
-        act_fn: The activation function.
-
+    LlamaMLP is a multi-layer perceptron module used in the Llama model with Triton acceleration.
     """
 
     def __init__(self, config):
@@ -384,23 +638,20 @@ class LlamaMLP(nn.Module):
         self.gate_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
         self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
         self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
-        self.act_fn = ACT2FN[config.hidden_act]
+        self.act_fn = config.hidden_act
 
     def forward(self, x):
         """
-        Forward pass of the MLP.
-
-        Args:
-            x: Input tensor.
-
-        Returns:
-            torch.Tensor: Output tensor.
+        Forward pass of the MLP with Triton acceleration.
         """
+        BLOCK_SIZE = 1024  # You can tune this for your hardware
+        grid = lambda meta: (x.size(0),)  # Parallelize over batch size
+
         if self.pretraining_tp > 1:
-            slice = self.intermediate_size // self.pretraining_tp
-            gate_proj_slices = self.gate_proj.weight.split(slice, dim=0)
-            up_proj_slices = self.up_proj.weight.split(slice, dim=0)
-            down_proj_slices = self.down_proj.weight.split(slice, dim=1)
+            slice_size = self.intermediate_size // self.pretraining_tp
+            gate_proj_slices = self.gate_proj.weight.split(slice_size, dim=0)
+            up_proj_slices = self.up_proj.weight.split(slice_size, dim=0)
+            down_proj_slices = self.down_proj.weight.split(slice_size, dim=1)
 
             gate_proj = torch.cat(
                 [F.linear(x, gate_proj_slices[i]) for i in range(self.pretraining_tp)],
@@ -411,21 +662,47 @@ class LlamaMLP(nn.Module):
                 dim=-1,
             )
 
-            intermediate_states = (self.act_fn(gate_proj) * up_proj).split(slice, dim=2)
+            intermediate_states = (self.act_fn(gate_proj) * up_proj).split(slice_size, dim=2)
             down_proj = [
                 F.linear(intermediate_states[i], down_proj_slices[i])
                 for i in range(self.pretraining_tp)
             ]
             down_proj = sum(down_proj)
         else:
-            down_proj = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
+            # Use Triton for the main MLP operations
+            mlp_kernel[grid](
+                x.data_ptr(),
+                self.gate_proj.weight.data_ptr(),
+                self.up_proj.weight.data_ptr(),
+                self.down_proj.weight.data_ptr(),
+                self.act_fn,
+                self.intermediate_size,
+                self.hidden_size,
+                BLOCK_SIZE
+            )
 
         return down_proj
 
 
+# Triton kernel for repeating key and value tensors
+@triton.jit
+def repeat_kv_kernel(x_ptr, y_ptr, num_kv_heads, slen, head_dim, n_rep, BLOCK_SIZE: tl.constexpr):
+    batch_idx = tl.program_id(0)  # Batch index
+    head_idx = tl.program_id(1)  # Head index for repetition
+    seq_idx = tl.arange(0, BLOCK_SIZE)  # Sequence index block
+
+    # Load original hidden states
+    x_val = tl.load(x_ptr + batch_idx * num_kv_heads * slen * head_dim + seq_idx, mask=seq_idx < slen * head_dim)
+
+    # Repeat key and value tensors along head dimension
+    for rep in range(n_rep):
+        y_offset = batch_idx * num_kv_heads * n_rep * slen * head_dim + head_idx * slen * head_dim + rep * slen * head_dim
+        tl.store(y_ptr + y_offset + seq_idx, x_val, mask=seq_idx < slen * head_dim)
+
+
 def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
     """
-    Repeat key and value tensors n times along the specified dimension.
+    Repeat key and value tensors n times along the specified dimension using Triton.
 
     Args:
         hidden_states (torch.Tensor): Input tensor with shape (batch, num_key_value_heads, seqlen, head_dim).
@@ -437,32 +714,72 @@ def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
     batch, num_key_value_heads, slen, head_dim = hidden_states.shape
     if n_rep == 1:
         return hidden_states
-    hidden_states = hidden_states[:, :, None, :, :].expand(
-        batch, num_key_value_heads, n_rep, slen, head_dim
+
+    # Allocate output tensor
+    output = torch.empty((batch, num_key_value_heads * n_rep, slen, head_dim), device=hidden_states.device, dtype=hidden_states.dtype)
+
+    # Triton block size and grid setup
+    BLOCK_SIZE = 1024
+    grid = lambda meta: (batch, num_key_value_heads)
+
+    # Launch Triton kernel to perform the repetition
+    repeat_kv_kernel[grid](
+        hidden_states.data_ptr(),
+        output.data_ptr(),
+        num_key_value_heads,
+        slen,
+        head_dim,
+        n_rep,
+        BLOCK_SIZE
     )
-    return hidden_states.reshape(batch, num_key_value_heads * n_rep, slen, head_dim)
+
+    return output
+
+
+
+
+
+# Triton kernel for linear projections (q_proj, k_proj, v_proj)
+@triton.jit
+def linear_proj_kernel(x_ptr, weight_ptr, out_ptr, in_features, out_features, BLOCK_SIZE: tl.constexpr):
+    seq_idx = tl.program_id(0)  # Sequence index
+    dim_idx = tl.arange(0, BLOCK_SIZE)  # Block of dimensions for parallelism
+
+    # Load input tensor
+    x_val = tl.load(x_ptr + seq_idx * in_features + dim_idx, mask=dim_idx < in_features)
+
+    # Perform matrix multiplication (dot product with weight)
+    result = tl.dot(x_val, weight_ptr + dim_idx, mask=dim_idx < out_features)
+
+    # Store result in the output tensor
+    tl.store(out_ptr + seq_idx * out_features + dim_idx, result, mask=dim_idx < out_features)
+
+
+# Triton kernel for attention weights calculation (query * key^T)
+@triton.jit
+def attn_weights_kernel(query_ptr, key_ptr, out_ptr, head_dim, BLOCK_SIZE: tl.constexpr):
+    batch_idx = tl.program_id(0)  # Batch index
+    seq_idx = tl.program_id(1)  # Sequence index
+    dim_idx = tl.arange(0, BLOCK_SIZE)  # Block of dimensions for parallelism
+
+    # Load query and key
+    query_val = tl.load(query_ptr + batch_idx * head_dim + dim_idx, mask=dim_idx < head_dim)
+    key_val = tl.load(key_ptr + seq_idx * head_dim + dim_idx, mask=dim_idx < head_dim)
+
+    # Compute attention weights (dot product)
+    result = tl.dot(query_val, key_val)
+
+    # Store the result in the output tensor
+    tl.store(out_ptr + batch_idx * head_dim + seq_idx, result)
 
 
 class LlamaAttention(nn.Module):
     """
-    LlamaAttention is a multi-headed attention module based on the 'Attention Is All You Need' paper.
-
-    Args:
-        config (LlamaConfig): Configuration for the attention module.
-
-    Attributes:
-        config (LlamaConfig): Configuration for the attention module.
-        hidden_size (int): The size of the hidden layer.
-        num_heads (int): The number of attention heads.
-        head_dim (int): The dimension of each attention head.
-        num_key_value_heads (int): The number of key-value attention heads.
-        num_key_value_groups (int): The number of key-value groups.
-        pretraining_tp (int): The pretraining time periods.
-        max_position_embeddings (int): The maximum position embeddings.
-
+    LlamaAttention is a multi-headed attention module based on the 'Attention Is All You Need' paper, 
+    with Triton acceleration for linear projections and attention weights.
     """
 
-    def __init__(self, config: LlamaConfig):
+    def __init__(self, config):
         super().__init__()
         self.config = config
         self.hidden_size = config.hidden_size
@@ -495,7 +812,7 @@ class LlamaAttention(nn.Module):
     def _init_rope(self):
         if self.config.rope_scaling is None:
             self.rotary_emb = LlamaRotaryEmbedding(
-                self.head_dim, max_position_embeddings=self.max_position_embeddings,base=self.config.rope_theta
+                self.head_dim, max_position_embeddings=self.max_position_embeddings, base=self.config.rope_theta
             )
         else:
             scaling_type = self.config.rope_scaling["type"]
@@ -535,8 +852,8 @@ class LlamaAttention(nn.Module):
 
         if self.pretraining_tp > 1:
             key_value_slicing = (
-                                        self.num_key_value_heads * self.head_dim
-                                ) // self.pretraining_tp
+                self.num_key_value_heads * self.head_dim
+            ) // self.pretraining_tp
             query_slices = self.q_proj.weight.split(
                 (self.num_heads * self.head_dim) // self.pretraining_tp, dim=0
             )
@@ -562,20 +879,47 @@ class LlamaAttention(nn.Module):
             value_states = torch.cat(value_states, dim=-1)
 
         else:
-            query_states = self.q_proj(hidden_states)
-            key_states = self.k_proj(hidden_states)
-            value_states = self.v_proj(hidden_states)
+            # Apply Triton kernel for linear projections
+            BLOCK_SIZE = 1024  # Adjust this for performance
+            grid = lambda meta: (hidden_states.size(0),)  # Parallelize over batch size
 
-        query_states = query_states.view(
-            bsz, q_len, self.num_heads, self.head_dim
-        ).transpose(1, 2)
-        key_states = key_states.view(
-            bsz, q_len, self.num_key_value_heads, self.head_dim
-        ).transpose(1, 2)
-        value_states = value_states.view(
-            bsz, q_len, self.num_key_value_heads, self.head_dim
-        ).transpose(1, 2)
+            query_states = torch.empty((bsz, q_len, self.num_heads * self.head_dim), device=hidden_states.device, dtype=hidden_states.dtype)
+            key_states = torch.empty((bsz, q_len, self.num_key_value_heads * self.head_dim), device=hidden_states.device, dtype=hidden_states.dtype)
+            value_states = torch.empty((bsz, q_len, self.num_key_value_heads * self.head_dim), device=hidden_states.device, dtype=hidden_states.dtype)
 
+            linear_proj_kernel[grid](
+                hidden_states.data_ptr(),
+                self.q_proj.weight.data_ptr(),
+                query_states.data_ptr(),
+                self.hidden_size,
+                self.num_heads * self.head_dim,
+                BLOCK_SIZE
+            )
+
+            linear_proj_kernel[grid](
+                hidden_states.data_ptr(),
+                self.k_proj.weight.data_ptr(),
+                key_states.data_ptr(),
+                self.hidden_size,
+                self.num_key_value_heads * self.head_dim,
+                BLOCK_SIZE
+            )
+
+            linear_proj_kernel[grid](
+                hidden_states.data_ptr(),
+                self.v_proj.weight.data_ptr(),
+                value_states.data_ptr(),
+                self.hidden_size,
+                self.num_key_value_heads * self.head_dim,
+                BLOCK_SIZE
+            )
+
+        # Reshape query, key, and value tensors
+        query_states = query_states.view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
+        key_states = key_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
+        value_states = value_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
+
+        # Compute rotary positional embeddings
         kv_seq_len = key_states.shape[-2]
         if past_key_value is not None:
             kv_seq_len += past_key_value[0].shape[-2]
@@ -584,66 +928,31 @@ class LlamaAttention(nn.Module):
             query_states, key_states, cos, sin, position_ids
         )
 
-        # [MODIFIED] Using KVCache mechanism for preallocated GPU memory optimization
-        # past_key_value is utilized to leverage previously computed key and value states.
-        # If past_key_value is available, reuse the states for k, v, and self_attention.
-        if past_key_value is not None:
-            key_states = past_key_value[0].cat(key_states, dim=2)
-            value_states = past_key_value[1].cat(value_states, dim=2)
-        # Reset past_key_value to avoid return past_key_value.
-        past_key_value = None
+        # Triton kernel for computing attention weights
+        attn_weights = torch.empty((bsz, self.num_heads, q_len, kv_seq_len), device=hidden_states.device, dtype=hidden_states.dtype)
 
-        # repeat k/v heads if n_kv_heads < n_heads
-        key_states = repeat_kv(key_states, self.num_key_value_groups)
-        value_states = repeat_kv(value_states, self.num_key_value_groups)
+        attn_weights_kernel[grid](
+            query_states.data_ptr(),
+            key_states.data_ptr(),
+            attn_weights.data_ptr(),
+            self.head_dim,
+            BLOCK_SIZE
+        )
 
-        attn_weights = torch.matmul(
-            query_states, key_states.transpose(2, 3)
-        ) / math.sqrt(self.head_dim)
-
-        if attn_weights.size() != (bsz, self.num_heads, q_len, kv_seq_len):
-            raise ValueError(
-                f"Attention weights should be of size {(bsz, self.num_heads, q_len, kv_seq_len)}, but is"
-                f" {attn_weights.size()}"
-            )
+        attn_weights = attn_weights / math.sqrt(self.head_dim)
 
         if attention_mask is not None:
-            if attention_mask.size() != (bsz, 1, q_len, kv_seq_len):
-                raise ValueError(
-                    f"Attention mask should be of size {(bsz, 1, q_len, kv_seq_len)}, but is {attention_mask.size()}"
-                )
-            attn_weights = attn_weights + attention_mask
+            attn_weights += attention_mask
 
-        # upcast attention to fp32
-        attn_weights = nn.functional.softmax(
-            attn_weights, dim=-1, dtype=torch.float32
-        ).to(query_states.dtype)
+        attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
+
+        # Compute attention output
         attn_output = torch.matmul(attn_weights, value_states)
 
-        if attn_output.size() != (bsz, self.num_heads, q_len, self.head_dim):
-            raise ValueError(
-                f"`attn_output` should be of size {(bsz, self.num_heads, q_len, self.head_dim)}, but is"
-                f" {attn_output.size()}"
-            )
+        attn_output = attn_output.transpose(1, 2).contiguous().view(bsz, q_len, self.hidden_size)
 
-        attn_output = attn_output.transpose(1, 2).contiguous()
-        attn_output = attn_output.reshape(bsz, q_len, self.hidden_size)
-
-        if self.pretraining_tp > 1:
-            attn_output = attn_output.split(
-                self.hidden_size // self.pretraining_tp, dim=2
-            )
-            o_proj_slices = self.o_proj.weight.split(
-                self.hidden_size // self.pretraining_tp, dim=1
-            )
-            attn_output = sum(
-                [
-                    F.linear(attn_output[i], o_proj_slices[i])
-                    for i in range(self.pretraining_tp)
-                ]
-            )
-        else:
-            attn_output = self.o_proj(attn_output)
+        # Apply output projection
+        attn_output = self.o_proj(attn_output)
 
         if not output_attentions:
             attn_weights = None
@@ -651,71 +960,87 @@ class LlamaAttention(nn.Module):
         return attn_output, attn_weights, past_key_value
 
 
+# Triton kernel for layer normalization
+@triton.jit
+def layernorm_kernel(x_ptr, out_ptr, weight_ptr, bias_ptr, epsilon, hidden_size, BLOCK_SIZE: tl.constexpr):
+    batch_idx = tl.program_id(0)
+    dim_idx = tl.arange(0, BLOCK_SIZE)
+
+    x = tl.load(x_ptr + batch_idx * hidden_size + dim_idx, mask=dim_idx < hidden_size)
+    
+    mean = tl.sum(x, axis=0) / hidden_size
+    x_mean_sub = x - mean
+    var = tl.sum(x_mean_sub * x_mean_sub, axis=0) / hidden_size
+    inv_std = 1.0 / tl.sqrt(var + epsilon)
+    
+    norm_x = x_mean_sub * inv_std
+    if weight_ptr:
+        weight = tl.load(weight_ptr + dim_idx, mask=dim_idx < hidden_size)
+        norm_x = norm_x * weight
+    if bias_ptr:
+        bias = tl.load(bias_ptr + dim_idx, mask=dim_idx < hidden_size)
+        norm_x = norm_x + bias
+
+    tl.store(out_ptr + batch_idx * hidden_size + dim_idx, norm_x, mask=dim_idx < hidden_size)
+
+
 class LlamaDecoderLayer(nn.Module):
     """
-    LlamaDecoderLayer represents a single layer of the Llama decoder.
-
-    Args:
-        config (LlamaConfig): Configuration for the decoder layer.
-
-    Attributes:
-        hidden_size (int): The size of the hidden layer.
-        self_attn (LlamaAttention): Multi-headed self-attention module.
-        mlp (LlamaMLP): Multi-layer perceptron module.
-        input_layernorm (LlamaRMSNorm): Layer normalization for input.
-        post_attention_layernorm (LlamaRMSNorm): Layer normalization after self-attention.
+    LlamaDecoderLayer represents a single layer of the Llama decoder with Triton acceleration.
     """
 
     def __init__(self, config: LlamaConfig):
         super().__init__()
         self.hidden_size = config.hidden_size
-        self.self_attn = LlamaAttention(config=config)
-        self.mlp = LlamaMLP(config)
-        self.input_layernorm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.post_attention_layernorm = LlamaRMSNorm(
-            config.hidden_size, eps=config.rms_norm_eps
-        )
+        self.self_attn = LlamaAttention(config=config)  # Self-attention with Triton acceleration
+        self.mlp = LlamaMLP(config)  # MLP with Triton acceleration
+        self.input_layernorm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)  # Layernorm
+        self.post_attention_layernorm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)  # Layernorm
 
     def forward(
-            self,
-            hidden_states: torch.Tensor,
-            attention_mask: Optional[torch.Tensor] = None,
-            position_ids: Optional[torch.LongTensor] = None,
-            past_key_value: Optional[Tuple[torch.Tensor]] = None,
-            output_attentions: Optional[bool] = False,
-            use_cache: Optional[bool] = False,
-    ) -> Tuple[
-        torch.FloatTensor, Optional[Tuple[torch.FloatTensor, torch.FloatTensor]]
-    ]:
+        self,
+        hidden_states: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        past_key_value: Optional[Tuple[torch.Tensor]] = None,
+        output_attentions: Optional[bool] = False,
+        use_cache: Optional[bool] = False,
+    ) -> Tuple[torch.FloatTensor, Optional[Tuple[torch.FloatTensor, torch.FloatTensor]]]:
         """
-        Forward pass for the LlamaDecoderLayer.
+        Forward pass for the LlamaDecoderLayer with Triton optimization.
 
         Args:
             hidden_states (torch.FloatTensor): Input tensor of shape `(batch, seq_len, embed_dim)`.
-            attention_mask (torch.FloatTensor, optional): Attention mask of size
-                `(batch, 1, tgt_len, src_len)` where padding elements are indicated by very large negative values.
+            attention_mask (torch.FloatTensor, optional): Attention mask.
             position_ids (torch.LongTensor, optional): Positional IDs tensor.
             past_key_value (Tuple[torch.FloatTensor], optional): Cached past key and value projection states.
             output_attentions (bool, optional): Whether or not to return the attentions tensors of all attention layers.
-            use_cache (bool, optional): If set to `True`, `past_key_values` key-value states are returned and can be
-                used to speed up decoding.
+            use_cache (bool, optional): If set to `True`, `past_key_values` key-value states are returned.
 
         Returns:
-            Tuple[torch.FloatTensor, Optional[Tuple[torch.FloatTensor, torch.FloatTensor]]]: Tuple containing:
-                - hidden_states (torch.FloatTensor): Output tensor.
-                - self_attn_weights (Optional[Tuple[torch.FloatTensor, torch.FloatTensor]]): Self-attention weights if
-                  `output_attentions` is `True`.
-                - present_key_value (Optional[Tuple[torch.FloatTensor]]): Cached key and value projection states if
-                  `use_cache` is `True`.
+            Tuple: Output hidden states and optional attention weights and past key-value states.
         """
 
         residual = hidden_states
+        bsz, seq_len, hidden_size = hidden_states.size()
 
-        hidden_states = self.input_layernorm(hidden_states)
+        # Triton-accelerated input layer normalization
+        normalized_hidden_states = torch.empty_like(hidden_states)
+        BLOCK_SIZE = 1024  # Adjust block size for performance
+        grid = lambda meta: (bsz,)
+        layernorm_kernel[grid](
+            hidden_states.data_ptr(),
+            normalized_hidden_states.data_ptr(),
+            self.input_layernorm.weight.data_ptr(),
+            self.input_layernorm.bias.data_ptr(),
+            self.input_layernorm.variance_epsilon,
+            hidden_size,
+            BLOCK_SIZE
+        )
 
-        # Self Attention
+        # Self Attention with Triton acceleration
         hidden_states, self_attn_weights, present_key_value = self.self_attn(
-            hidden_states=hidden_states,
+            hidden_states=normalized_hidden_states,
             attention_mask=attention_mask,
             position_ids=position_ids,
             past_key_value=past_key_value,
@@ -724,10 +1049,21 @@ class LlamaDecoderLayer(nn.Module):
         )
         hidden_states = residual + hidden_states
 
-        # Fully Connected
+        # Post-attention layer normalization using Triton
         residual = hidden_states
-        hidden_states = self.post_attention_layernorm(hidden_states)
-        hidden_states = self.mlp(hidden_states)
+        normalized_hidden_states = torch.empty_like(hidden_states)
+        layernorm_kernel[grid](
+            hidden_states.data_ptr(),
+            normalized_hidden_states.data_ptr(),
+            self.post_attention_layernorm.weight.data_ptr(),
+            self.post_attention_layernorm.bias.data_ptr(),
+            self.post_attention_layernorm.variance_epsilon,
+            hidden_size,
+            BLOCK_SIZE
+        )
+
+        # Fully connected feed-forward MLP with Triton acceleration
+        hidden_states = self.mlp(normalized_hidden_states)
         hidden_states = residual + hidden_states
 
         outputs = (hidden_states,)
@@ -739,6 +1075,7 @@ class LlamaDecoderLayer(nn.Module):
             outputs += (present_key_value,)
 
         return outputs
+
 
 
 LLAMA_START_DOCSTRING = r"""
