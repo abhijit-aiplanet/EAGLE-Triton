@@ -1,4 +1,6 @@
 import torch
+import triton
+import triton.language as tl
 
 
 class KVCache:
@@ -35,6 +37,16 @@ class KVCache:
             self.data.shape[3],
         )
 
+    @staticmethod
+    @triton.jit
+    def triton_copy(dst_ptr, src_ptr, N, BLOCK_SIZE: tl.constexpr):
+        pid = tl.program_id(axis=0)
+        block_start = pid * BLOCK_SIZE
+        offsets = block_start + tl.arange(0, BLOCK_SIZE)
+        mask = offsets < N
+        dst = tl.load(src_ptr + offsets, mask=mask)
+        tl.store(dst_ptr + offsets, dst, mask=mask)
+
     def copy(self, indices: torch.Tensor, prev_length: int, dim: int = 2):
         """
         Copy values from the current data at specified indices to a new location.
@@ -46,7 +58,16 @@ class KVCache:
         """
         tgt = self.data.index_select(dim, indices)
         dst = self.data.narrow(dim, prev_length, tgt.shape[dim])
-        dst.copy_(tgt, non_blocking=True)
+
+        # Using Triton to perform the copy operation.
+        N = tgt.numel()
+        BLOCK_SIZE = 1024  # You can tune the block size based on performance.
+        grid = lambda meta: (N + meta['BLOCK_SIZE'] - 1) // meta['BLOCK_SIZE']
+        
+        # Launch Triton kernel for copying data
+        KVCache.triton_copy[grid](
+            dst.data_ptr(), tgt.data_ptr(), N, BLOCK_SIZE
+        )
         self.current_length.fill_(prev_length + tgt.shape[dim])
 
     def cat(self, tensor: torch.Tensor, dim: int = 2):
@@ -61,7 +82,16 @@ class KVCache:
             torch.Tensor: The data tensor after concatenation up to the current length.
         """
         dst = self.data.narrow(dim, self.current_length, tensor.shape[dim])
-        dst.copy_(tensor)
+
+        # Using Triton to perform the copy operation for concatenation.
+        N = tensor.numel()
+        BLOCK_SIZE = 1024  # You can tune the block size based on performance.
+        grid = lambda meta: (N + meta['BLOCK_SIZE'] - 1) // meta['BLOCK_SIZE']
+
+        # Launch Triton kernel for copying data
+        KVCache.triton_copy[grid](
+            dst.data_ptr(), tensor.data_ptr(), N, BLOCK_SIZE
+        )
         self.current_length.add_(tensor.shape[dim])
         return torch.narrow(self.data, 2, 0, self.current_length)
 
