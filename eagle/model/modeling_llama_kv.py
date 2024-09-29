@@ -293,7 +293,7 @@ class LlamaRotaryEmbedding(nn.Module):
             dtype=torch.get_default_dtype(),
         )
 
-    def set_cos_sin_cache(self, seq_len, device, dtype):
+    def _set_cos_sin_cache(self, seq_len, device, dtype):
         """
         Set the cosine and sine cache for positional embeddings using Triton.
         Args:
