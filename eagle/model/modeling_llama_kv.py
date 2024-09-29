@@ -265,6 +265,7 @@ def rotary_embedding_kernel(
 
 
 
+
 class LlamaRotaryEmbedding(nn.Module):
     """
     Llama Rotary Positional Embedding Module using Triton for faster computation of embeddings.
@@ -306,17 +307,19 @@ class LlamaRotaryEmbedding(nn.Module):
         t = torch.arange(self.max_seq_len_cached, device=device, dtype=self.inv_freq.dtype)
         freqs = torch.einsum("i,j->ij", t, self.inv_freq)
         emb = torch.cat((freqs, freqs), dim=-1).contiguous()
-        
+    
         # Ensure emb is in the correct dtype
         emb = emb.to(dtype)
         
         # Allocate memory for cosine and sine buffers
         cos_cache = torch.empty_like(emb, dtype=dtype, device=device)
         sin_cache = torch.empty_like(emb, dtype=dtype, device=device)
+    
+        BLOCK_SIZE = 1024  # Adjust this based on your hardware for optimal performance
         
-        BLOCK_SIZE = 1024  # You can adjust this based on your hardware for optimal performance
-        grid = (seq_len,)  # Grid parallelizes across the sequence length
-        
+        # Grid size adjusted for parallelism across sequence length and dimension
+        grid = (seq_len, emb.shape[1] // BLOCK_SIZE)  # You may need to adjust based on your dimension size
+    
         # Launch the Triton kernel to calculate cos and sin embeddings
         rotary_embedding_kernel[grid](
             emb.data_ptr(), 
@@ -330,6 +333,7 @@ class LlamaRotaryEmbedding(nn.Module):
         # Register the buffers for future access
         self.register_buffer("cos_cached", cos_cache.unsqueeze(0).unsqueeze(0), persistent=False)
         self.register_buffer("sin_cached", sin_cache.unsqueeze(0).unsqueeze(0), persistent=False)
+
 
     def forward(self, x, seq_len=None):
         """
