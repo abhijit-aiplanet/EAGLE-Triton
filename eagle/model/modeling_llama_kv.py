@@ -233,7 +233,6 @@ class LlamaRMSNorm(nn.Module):
         return normed_states.to(input_dtype)  # Convert back to original dtype if needed
 
 
-# Triton kernel to calculate cosine and sine embeddings
 @triton.jit
 def rotary_embedding_kernel(
     emb_ptr, 
@@ -263,23 +262,9 @@ def rotary_embedding_kernel(
     tl.store(cos_ptr + offset, cos_val, mask=dim_idx < dim)
     tl.store(sin_ptr + offset, sin_val, mask=dim_idx < dim)
 
-
-
-
-class LlamaRotaryEmbedding(nn.Module):
-    """
-    Llama Rotary Positional Embedding Module using Triton for faster computation of embeddings.
-
-    Args:
-        dim (int): The dimension of the embedding.
-        max_position_embeddings (int, optional): The maximum position for embeddings. Default is 2048.
-        base (int, optional): The base value for rotational encoding. Default is 10000.
-        device (str, optional): The device on which the computation will be performed. Default is None.
-    """
-
+class LlamaRotaryEmbedding(torch.nn.Module):
     def __init__(self, dim, max_position_embeddings=2048, base=10000, device=None):
         super().__init__()
-
         self.dim = dim
         self.max_position_embeddings = max_position_embeddings
         self.base = base
@@ -287,8 +272,6 @@ class LlamaRotaryEmbedding(nn.Module):
             self.base ** (torch.arange(0, self.dim, 2).float().to(device) / self.dim)
         )
         self.register_buffer("inv_freq", inv_freq)
-
-        # Initialize cosine and sine cache using Triton for efficiency
         self._set_cos_sin_cache(
             seq_len=max_position_embeddings,
             device=self.inv_freq.device,
@@ -296,13 +279,6 @@ class LlamaRotaryEmbedding(nn.Module):
         )
 
     def _set_cos_sin_cache(self, seq_len, device, dtype):
-        """
-        Set the cosine and sine cache for positional embeddings using Triton.
-        Args:
-            seq_len (int): The sequence length.
-            device (str): The device on which the cache tensors will be stored.
-            dtype: The data type of the cache tensors.
-        """
         self.max_seq_len_cached = seq_len
         t = torch.arange(self.max_seq_len_cached, device=device, dtype=self.inv_freq.dtype)
         freqs = torch.einsum("i,j->ij", t, self.inv_freq)
@@ -317,14 +293,14 @@ class LlamaRotaryEmbedding(nn.Module):
     
         BLOCK_SIZE = 1024  # Adjust this based on your hardware for optimal performance
         
-        # Grid size adjusted for parallelism across sequence length and dimension
-        grid = (seq_len, emb.shape[1] // BLOCK_SIZE)  # You may need to adjust based on your dimension size
+        # Grid size adjusted for parallelism across sequence length
+        grid = (seq_len,)
     
         # Launch the Triton kernel to calculate cos and sin embeddings
         rotary_embedding_kernel[grid](
-            emb.data_ptr(), 
-            cos_cache.data_ptr(), 
-            sin_cache.data_ptr(), 
+            emb, 
+            cos_cache, 
+            sin_cache, 
             seq_len, 
             emb.shape[1],  # This is the dimension size
             BLOCK_SIZE
@@ -334,21 +310,9 @@ class LlamaRotaryEmbedding(nn.Module):
         self.register_buffer("cos_cached", cos_cache.unsqueeze(0).unsqueeze(0), persistent=False)
         self.register_buffer("sin_cached", sin_cache.unsqueeze(0).unsqueeze(0), persistent=False)
 
-
     def forward(self, x, seq_len=None):
-        """
-        Forward pass of the LlamaRotaryEmbedding module.
-
-        Args:
-            x (torch.Tensor): Input tensor of shape [bs, num_attention_heads, seq_len, head_size].
-            seq_len (int): The sequence length. If greater than the cached length, the cache will be updated.
-
-        Returns:
-            tuple: A tuple containing two tensors, the cosine and sine embeddings, both of shape [1, 1, seq_len, dim].
-        """
         if seq_len > self.max_seq_len_cached:
             self._set_cos_sin_cache(seq_len=seq_len, device=x.device, dtype=x.dtype)
-
         return (
             self.cos_cached[:, :, :seq_len, ...].to(dtype=x.dtype),
             self.sin_cached[:, :, :seq_len, ...].to(dtype=x.dtype),
