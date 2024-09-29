@@ -233,33 +233,30 @@ def compute_rotary_cos_sin_kernel(
 ):
     seq_id = tl.program_id(0)
     dim_id = tl.arange(0, dim)
-
+    
     # Load time steps and inverse frequency
-    t = tl.load(t_ptr, seq_id)
-    inv_freq = tl.load(inv_freq_ptr + dim_id)
-
+    t = tl.load(t_ptr + seq_id * stride_t)
+    inv_freq = tl.load(inv_freq_ptr + dim_id * stride_f)
+    
     # Compute frequency products
     freqs = t * inv_freq
-
+    
     # Calculate cos and sin
     cos = tl.cos(freqs)
     sin = tl.sin(freqs)
-
+    
     # Store the results in the output buffers
-    tl.store(cos_ptr + seq_id * stride_c + dim_id, cos)
-    tl.store(sin_ptr + seq_id * stride_s + dim_id, sin)
-
+    tl.store(cos_ptr + seq_id * stride_c + dim_id * tl.constexpr(1), cos)
+    tl.store(sin_ptr + seq_id * stride_s + dim_id * tl.constexpr(1), sin)
 
 class LlamaRotaryEmbedding(torch.nn.Module):
     def __init__(self, dim, max_position_embeddings=2048, base=10000, device=None):
         super().__init__()
-
         self.dim = dim
         self.max_position_embeddings = max_position_embeddings
         self.base = base
         inv_freq = 1.0 / (self.base ** (torch.arange(0, self.dim, 2).float().to(device) / self.dim))
         self.register_buffer("inv_freq", inv_freq, persistent=False)
-
         # Build cos/sin cache for the default max sequence length
         self._set_cos_sin_cache(
             seq_len=max_position_embeddings, device=self.inv_freq.device, dtype=torch.get_default_dtype()
@@ -267,28 +264,17 @@ class LlamaRotaryEmbedding(torch.nn.Module):
 
     def _set_cos_sin_cache(self, seq_len, device, dtype):
         self.max_seq_len_cached = seq_len
-
         # Prepare tensors for time steps and frequencies
         t = torch.arange(self.max_seq_len_cached, device=device, dtype=self.inv_freq.dtype)
         cos_cached = torch.empty((seq_len, self.dim), dtype=dtype, device=device)
         sin_cached = torch.empty((seq_len, self.dim), dtype=dtype, device=device)
 
         # Triton kernel launch for cos/sin computation
-        t_ptr = t.data_ptr()
-        inv_freq_ptr = self.inv_freq.data_ptr()
-        cos_ptr = cos_cached.data_ptr()
-        sin_ptr = sin_cached.data_ptr()
-
-        # Define strides for Triton access
-        stride_t = t.stride(0)
-        stride_f = self.inv_freq.stride(0)
-        stride_c = cos_cached.stride(0)
-        stride_s = sin_cached.stride(0)
-
-        # Launch the Triton kernel
         grid = (seq_len,)
         compute_rotary_cos_sin_kernel[grid](
-            t_ptr, inv_freq_ptr, cos_ptr, sin_ptr, seq_len, self.dim, stride_t, stride_f, stride_c, stride_s
+            t, self.inv_freq, cos_cached, sin_cached,
+            seq_len, self.dim,
+            t.stride(0), self.inv_freq.stride(0), cos_cached.stride(0), sin_cached.stride(0)
         )
 
         # Store cos and sin cache
@@ -301,12 +287,10 @@ class LlamaRotaryEmbedding(torch.nn.Module):
         # x: [bs, num_attention_heads, seq_len, head_size]
         if seq_len > self.max_seq_len_cached:
             self._set_cos_sin_cache(seq_len=seq_len, device=x.device, dtype=x.dtype)
-
         return (
             self.cos_cached[:, :, :seq_len, ...].to(dtype=x.dtype),
             self.sin_cached[:, :, :seq_len, ...].to(dtype=x.dtype),
         )
-
 
 
 # Triton kernel for computing cos and sin cache with scaling factor
