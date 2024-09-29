@@ -252,11 +252,6 @@ def rotary_embedding_kernel(
     # Offset for the current sequence
     offset = seq_idx * dim + dim_idx
     
-    # Cast the pointers to float32 type
-    emb_ptr = emb_ptr.to(tl.float32)
-    cos_ptr = cos_ptr.to(tl.float32)
-    sin_ptr = sin_ptr.to(tl.float32)
-    
     # Load emb values
     emb_val = tl.load(emb_ptr + offset, mask=dim_idx < dim)
     
