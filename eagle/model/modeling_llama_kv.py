@@ -274,6 +274,10 @@ class LlamaRotaryEmbedding(torch.nn.Module):
         self.dim = dim
         self.max_position_embeddings = max_position_embeddings
         self.base = base
+        
+        if device is None:
+            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        
         inv_freq = 1.0 / (
             self.base ** (torch.arange(0, self.dim, 2).float().to(device) / self.dim)
         )
@@ -282,11 +286,14 @@ class LlamaRotaryEmbedding(torch.nn.Module):
         # Initialize with float32, we'll convert to the appropriate dtype in _set_cos_sin_cache
         self._set_cos_sin_cache(
             seq_len=max_position_embeddings,
-            device=self.inv_freq.device,
+            device=device,
             dtype=torch.float32,
         )
 
     def _set_cos_sin_cache(self, seq_len, device, dtype):
+        if device.type == "cpu":
+            raise ValueError("Triton kernels require GPU tensors. Please use a CUDA device.")
+        
         self.max_seq_len_cached = seq_len
         t = torch.arange(self.max_seq_len_cached, device=device, dtype=self.inv_freq.dtype)
         freqs = torch.einsum("i,j->ij", t, self.inv_freq)
@@ -319,8 +326,11 @@ class LlamaRotaryEmbedding(torch.nn.Module):
         self.register_buffer("sin_cached", sin_cache.unsqueeze(0).unsqueeze(0), persistent=False)
 
     def forward(self, x, seq_len=None):
-        # Ensure that cos_cached and sin_cached are in the same dtype as x
-        if self.cos_cached.dtype != x.dtype:
+        if x.device.type == "cpu":
+            raise ValueError("Input tensor must be on a CUDA device for Triton kernel execution.")
+        
+        # Ensure that cos_cached and sin_cached are in the same dtype and device as x
+        if self.cos_cached.dtype != x.dtype or self.cos_cached.device != x.device:
             self._set_cos_sin_cache(seq_len=self.max_seq_len_cached, device=x.device, dtype=x.dtype)
         
         if seq_len > self.max_seq_len_cached:
@@ -330,6 +340,14 @@ class LlamaRotaryEmbedding(torch.nn.Module):
             self.cos_cached[:, :, :seq_len, ...],
             self.sin_cached[:, :, :seq_len, ...],
         )
+
+# Helper function to check if CUDA is available
+def cuda_is_available():
+    return torch.cuda.is_available()
+
+# Helper function to get the current CUDA device
+def get_cuda_device():
+    return torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
 # Triton kernel to calculate cosine and sine embeddings with scaling
