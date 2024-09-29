@@ -224,26 +224,27 @@ def apply_rotary_pos_emb(q, k, cos, sin, position_ids):
 
 
 
-import triton
-import triton.language as tl
-import torch
-
 # Triton kernel to compute cos and sin cache for rotary embeddings
 @triton.jit
-def compute_rotary_cos_sin_scaling_kernel(t_ptr, inv_freq_ptr, scaling_factor, cos_ptr, sin_ptr, seq_len, dim: tl.constexpr, stride_t, stride_f, stride_c, stride_s):
+def compute_rotary_cos_sin_kernel(t_ptr, inv_freq_ptr, cos_ptr, sin_ptr, seq_len, dim: tl.constexpr, stride_t, stride_f, stride_c, stride_s):
     seq_id = tl.program_id(0)
     dim_id = tl.arange(0, dim)
+
     # Load time steps and inverse frequency
     t = tl.load(t_ptr + seq_id * stride_t)
     inv_freq = tl.load(inv_freq_ptr + dim_id)
-    # Compute frequency products with scaling
-    freqs = t * inv_freq * scaling_factor
+
+    # Compute frequency products
+    freqs = t * inv_freq
+
     # Calculate cos and sin
-    cos = tl.cos(freqs)
-    sin = tl.sin(freqs)
+    cos = tl.math.cos(freqs)
+    sin = tl.math.sin(freqs)
+
     # Store the results in the output buffers
     tl.store(cos_ptr + seq_id * stride_c + dim_id, cos)
     tl.store(sin_ptr + seq_id * stride_s + dim_id, sin)
+
 
 class LlamaRotaryEmbedding(torch.nn.Module):
     def __init__(self, dim, max_position_embeddings=2048, base=10000, device=None):
@@ -302,19 +303,25 @@ class LlamaRotaryEmbedding(torch.nn.Module):
             self.sin_cached[:, :, :seq_len, ...].to(dtype=x.dtype),
         )
 
+
+
 # Triton kernel for computing cos and sin cache with scaling factor
 @triton.jit
 def compute_rotary_cos_sin_scaling_kernel(t_ptr, inv_freq_ptr, scaling_factor, cos_ptr, sin_ptr, seq_len, dim: tl.constexpr, stride_t, stride_f, stride_c, stride_s):
     seq_id = tl.program_id(0)
     dim_id = tl.arange(0, dim)
+
     # Load time steps and inverse frequency
-    t = tl.load(t_ptr + seq_id * stride_t)
+    t = tl.load(t_ptr + seq_id * stride_t) / scaling_factor
     inv_freq = tl.load(inv_freq_ptr + dim_id)
-    # Compute frequency products with scaling
-    freqs = t * inv_freq * scaling_factor
+
+    # Compute frequency products
+    freqs = t * inv_freq
+
     # Calculate cos and sin
-    cos = tl.cos(freqs)
-    sin = tl.sin(freqs)
+    cos = tl.math.cos(freqs)
+    sin = tl.math.sin(freqs)
+
     # Store the results in the output buffers
     tl.store(cos_ptr + seq_id * stride_c + dim_id, cos)
     tl.store(sin_ptr + seq_id * stride_s + dim_id, sin)
@@ -358,6 +365,7 @@ class LlamaLinearScalingRotaryEmbedding(LlamaRotaryEmbedding):
         emb_sin = torch.cat((sin_cached, sin_cached), dim=-1).unsqueeze(0).unsqueeze(0)
         self.register_buffer("cos_cached", emb_cos, persistent=False)
         self.register_buffer("sin_cached", emb_sin, persistent=False)
+
 
 
 # Triton kernel for computing cos and sin cache with dynamic NTK scaling
