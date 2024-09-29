@@ -93,11 +93,6 @@ def _make_causal_mask(
     )
 
 
-import torch
-import triton
-import triton.language as tl
-
-
 # Triton kernel for expanding the attention mask
 @triton.jit
 def expand_mask_kernel(
@@ -240,20 +235,33 @@ class LlamaRMSNorm(nn.Module):
 
 # Triton kernel to calculate cosine and sine embeddings
 @triton.jit
-def rotary_embedding_kernel(freqs_ptr, cos_ptr, sin_ptr, seq_len, dim, BLOCK_SIZE: tl.constexpr):
-    seq_idx = tl.program_id(0)  # Sequence index for the batch
-    dim_idx = tl.arange(0, BLOCK_SIZE)  # Dimension index block for parallelism
-
-    # Calculate the frequency for each sequence index and dimension
-    freq_val = tl.load(freqs_ptr + seq_idx * dim + dim_idx, mask=dim_idx < dim)
-
-    # Calculate cosine and sine of the frequency
-    cos_val = tl.cos(freq_val)
-    sin_val = tl.sin(freq_val)
-
+def rotary_embedding_kernel(
+    emb_ptr, 
+    cos_ptr, 
+    sin_ptr, 
+    seq_len, 
+    dim, 
+    BLOCK_SIZE: tl.constexpr
+):
+    # Sequence index for the batch
+    seq_idx = tl.program_id(0)
+    
+    # Dimension index block for parallelism
+    dim_idx = tl.arange(0, BLOCK_SIZE)
+    
+    # Offset for the current sequence
+    offset = seq_idx * dim + dim_idx
+    
+    # Load emb values
+    emb_val = tl.load(emb_ptr + offset, mask=dim_idx < dim)
+    
+    # Calculate cosine and sine
+    cos_val = tl.cos(emb_val)
+    sin_val = tl.sin(emb_val)
+    
     # Store the calculated cos and sin values
-    tl.store(cos_ptr + seq_idx * dim + dim_idx, cos_val, mask=dim_idx < dim)
-    tl.store(sin_ptr + seq_idx * dim + dim_idx, sin_val, mask=dim_idx < dim)
+    tl.store(cos_ptr + offset, cos_val, mask=dim_idx < dim)
+    tl.store(sin_ptr + offset, sin_val, mask=dim_idx < dim)
 
 
 class LlamaRotaryEmbedding(nn.Module):
@@ -285,10 +293,9 @@ class LlamaRotaryEmbedding(nn.Module):
             dtype=torch.get_default_dtype(),
         )
 
-    def _set_cos_sin_cache(self, seq_len, device, dtype):
+    def set_cos_sin_cache(self, seq_len, device, dtype):
         """
         Set the cosine and sine cache for positional embeddings using Triton.
-
         Args:
             seq_len (int): The sequence length.
             device (str): The device on which the cache tensors will be stored.
@@ -296,30 +303,32 @@ class LlamaRotaryEmbedding(nn.Module):
         """
         self.max_seq_len_cached = seq_len
         t = torch.arange(self.max_seq_len_cached, device=device, dtype=self.inv_freq.dtype)
-
         freqs = torch.einsum("i,j->ij", t, self.inv_freq)
-        emb = torch.cat((freqs, freqs), dim=-1)
-
+        emb = torch.cat((freqs, freqs), dim=-1).contiguous()
+        
+        # Ensure emb is in the correct dtype
+        emb = emb.to(dtype)
+        
         # Allocate memory for cosine and sine buffers
         cos_cache = torch.empty_like(emb, dtype=dtype, device=device)
         sin_cache = torch.empty_like(emb, dtype=dtype, device=device)
-
+        
         BLOCK_SIZE = 1024  # You can adjust this based on your hardware for optimal performance
-        grid = lambda meta: (seq_len,)  # Grid parallelizes across the sequence length
-
+        grid = (seq_len,)  # Grid parallelizes across the sequence length
+        
         # Launch the Triton kernel to calculate cos and sin embeddings
         rotary_embedding_kernel[grid](
             emb.data_ptr(), 
             cos_cache.data_ptr(), 
             sin_cache.data_ptr(), 
             seq_len, 
-            self.dim, 
+            emb.shape[1],  # This is the dimension size
             BLOCK_SIZE
         )
-
+        
         # Register the buffers for future access
-        self.register_buffer("cos_cached", cos_cache[None, None, :, :], persistent=False)
-        self.register_buffer("sin_cached", sin_cache[None, None, :, :], persistent=False)
+        self.register_buffer("cos_cached", cos_cache.unsqueeze(0).unsqueeze(0), persistent=False)
+        self.register_buffer("sin_cached", sin_cache.unsqueeze(0).unsqueeze(0), persistent=False)
 
     def forward(self, x, seq_len=None):
         """
