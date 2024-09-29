@@ -239,8 +239,8 @@ def compute_rotary_cos_sin_scaling_kernel(t_ptr, inv_freq_ptr, scaling_factor, c
     # Compute frequency products with scaling
     freqs = t * inv_freq * scaling_factor
     # Calculate cos and sin
-    cos = tl.math.cos(freqs)
-    sin = tl.math.sin(freqs)
+    cos = tl.cos(freqs)
+    sin = tl.sin(freqs)
     # Store the results in the output buffers
     tl.store(cos_ptr + seq_id * stride_c + dim_id, cos)
     tl.store(sin_ptr + seq_id * stride_s + dim_id, sin)
@@ -316,8 +316,8 @@ def compute_rotary_cos_sin_scaling_kernel(t_ptr, inv_freq_ptr, scaling_factor, c
     freqs = t * inv_freq
 
     # Calculate cos and sin
-    cos = tl.math.cos(freqs)
-    sin = tl.math.sin(freqs)
+    cos = tl.cos(freqs)
+    sin = tl.sin(freqs)
 
     # Store the results in the output buffers
     tl.store(cos_ptr + seq_id * stride_c + dim_id, cos)
@@ -378,8 +378,8 @@ def compute_rotary_cos_sin_dynamic_ntk_kernel(t_ptr, inv_freq_ptr, cos_ptr, sin_
     freqs = t * inv_freq
 
     # Calculate cos and sin
-    cos = tl.math.cos(freqs)
-    sin = tl.math.sin(freqs)
+    cos = tl.cos(freqs)
+    sin = tl.sin(freqs)
 
     # Store the results in the output buffers
     tl.store(cos_ptr + seq_id * stride_c + dim_id, cos)
@@ -498,9 +498,9 @@ class LlamaAttention(nn.Module):
         j = pid % BLOCK_SIZE
         # Dot product and scaling
         dot_prod = Q[i, j] * K[j, i]
-        scaled = dot_prod / tl.math.sqrt(BLOCK_SIZE)
+        scaled = dot_prod / tl.sqrt(BLOCK_SIZE)
         # Compute softmax
-        out[i, j] = tl.math.exp(scaled) / tl.math.sum(tl.math.exp(scaled), axis=1)
+        out[i, j] = tl.exp(scaled) / tl.sum(tl.exp(scaled), axis=1)
 
     def forward(self, hidden_states: torch.Tensor, attention_mask: Optional[torch.Tensor] = None,
                 position_ids: Optional[torch.LongTensor] = None, past_key_value: Optional[Tuple[torch.Tensor]] = None,
