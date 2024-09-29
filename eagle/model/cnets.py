@@ -235,8 +235,8 @@ def compute_rotary_cos_sin_kernel(
     dim_id = tl.arange(0, dim)
 
     # Load time steps and inverse frequency
-    t = tl.load(t_ptr + seq_id * stride_t)
-    inv_freq = tl.load(inv_freq_ptr + dim_id * stride_f)
+    t = tl.load(t_ptr, seq_id)
+    inv_freq = tl.load(inv_freq_ptr + dim_id)
 
     # Compute frequency products
     freqs = t * inv_freq
@@ -246,8 +246,8 @@ def compute_rotary_cos_sin_kernel(
     sin = tl.sin(freqs)
 
     # Store the results in the output buffers
-    tl.store(cos_ptr + seq_id * stride_c + dim_id * stride_c, cos)
-    tl.store(sin_ptr + seq_id * stride_s + dim_id * stride_s, sin)
+    tl.store(cos_ptr + seq_id * stride_c + dim_id, cos)
+    tl.store(sin_ptr + seq_id * stride_s + dim_id, sin)
 
 
 class LlamaRotaryEmbedding(torch.nn.Module):
