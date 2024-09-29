@@ -438,7 +438,7 @@ class LlamaDynamicNTKScalingRotaryEmbedding(LlamaRotaryEmbedding):
         self.register_buffer("cos_cached", emb_cos, persistent=False)
         self.register_buffer("sin_cached", emb_sin, persistent=False)
 
-class LlamaAttentionTriton(nn.Module):
+class LlamaAttention(nn.Module):
     """Multi-headed attention with Triton optimization."""
 
     def __init__(self, config):
