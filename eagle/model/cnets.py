@@ -47,7 +47,7 @@ import torch
 
 # Updated _make_causal_mask function using Triton
 @triton.jit
-def _make_causal_mask_triton(mask_ptr, tgt_len, dtype_min, stride_m, stride_n):
+def _make_causal_mask_triton(mask_ptr, tgt_len: tl.constexpr, dtype_min, stride_m, stride_n):
     row_idx = tl.program_id(0)
     col_idx = tl.arange(0, tgt_len)
 
@@ -79,7 +79,7 @@ def _make_causal_mask(input_ids_shape: torch.Size, dtype: torch.dtype, device: t
 
 # Updated _expand_mask function using Triton
 @triton.jit
-def _expand_mask_triton(mask_ptr, inverted_mask_ptr, bsz, src_len, tgt_len, dtype_min, stride_m):
+def _expand_mask_triton(mask_ptr, inverted_mask_ptr, bsz, src_len: tl.constexpr, tgt_len, dtype_min, stride_m):
     b_idx = tl.program_id(0)
     s_idx = tl.arange(0, src_len)
 
@@ -114,7 +114,7 @@ def _expand_mask(mask: torch.Tensor, dtype: torch.dtype, tgt_len: Optional[int] 
 
 # Updated repeat_kv function using Triton
 @triton.jit
-def repeat_kv_triton(hidden_ptr, out_ptr, bsz, num_kv_heads, n_rep, slen, head_dim, stride_b, stride_h, stride_s, stride_d):
+def repeat_kv_triton(hidden_ptr, out_ptr, bsz, num_kv_heads: tl.constexpr, n_rep: tl.constexpr, slen, head_dim, stride_b, stride_h, stride_s, stride_d):
     b_idx = tl.program_id(0)
     h_idx = tl.arange(0, num_kv_heads * n_rep)
 
@@ -156,7 +156,7 @@ def rotate_half(x):
 @triton.jit
 def apply_rotary_pos_emb_triton(
     q_ptr, k_ptr, cos_ptr, sin_ptr, out_q_ptr, out_k_ptr,
-    seq_len, dim, head_dim, stride_q, stride_k, stride_o, stride_c, stride_s
+    seq_len, dim: tl.constexpr, head_dim, stride_q, stride_k, stride_o, stride_c, stride_s
 ):
     batch_id = tl.program_id(0)
     seq_id = tl.program_id(1)
@@ -230,7 +230,7 @@ import torch
 
 # Triton kernel to compute cos and sin cache for rotary embeddings
 @triton.jit
-def compute_rotary_cos_sin_kernel(t_ptr, inv_freq_ptr, cos_ptr, sin_ptr, seq_len, dim, stride_t, stride_f, stride_c, stride_s):
+def compute_rotary_cos_sin_kernel(t_ptr, inv_freq_ptr, cos_ptr, sin_ptr, seq_len, dim: tl.constexpr, stride_t, stride_f, stride_c, stride_s):
     seq_id = tl.program_id(0)
     dim_id = tl.arange(0, dim)
 
@@ -309,7 +309,7 @@ class LlamaRotaryEmbedding(torch.nn.Module):
 
 # Triton kernel for computing cos and sin cache with scaling factor
 @triton.jit
-def compute_rotary_cos_sin_scaling_kernel(t_ptr, inv_freq_ptr, scaling_factor, cos_ptr, sin_ptr, seq_len, dim, stride_t, stride_f, stride_c, stride_s):
+def compute_rotary_cos_sin_scaling_kernel(t_ptr, inv_freq_ptr, scaling_factor, cos_ptr, sin_ptr, seq_len, dim tl.constexpr, stride_t, stride_f, stride_c, stride_s):
     seq_id = tl.program_id(0)
     dim_id = tl.arange(0, dim)
 
@@ -371,7 +371,7 @@ class LlamaLinearScalingRotaryEmbedding(LlamaRotaryEmbedding):
 
 # Triton kernel for computing cos and sin cache with dynamic NTK scaling
 @triton.jit
-def compute_rotary_cos_sin_dynamic_ntk_kernel(t_ptr, inv_freq_ptr, cos_ptr, sin_ptr, seq_len, dim, stride_t, stride_f, stride_c, stride_s):
+def compute_rotary_cos_sin_dynamic_ntk_kernel(t_ptr, inv_freq_ptr, cos_ptr, sin_ptr, seq_len, dim: tl.constexpr, stride_t, stride_f, stride_c, stride_s):
     seq_id = tl.program_id(0)
     dim_id = tl.arange(0, dim)
 
