@@ -226,24 +226,28 @@ def apply_rotary_pos_emb(q, k, cos, sin, position_ids):
 
 # Triton kernel to compute cos and sin cache for rotary embeddings
 @triton.jit
-def compute_rotary_cos_sin_kernel(t_ptr, inv_freq_ptr, cos_ptr, sin_ptr, seq_len, dim: tl.constexpr, stride_t, stride_f, stride_c, stride_s):
+def compute_rotary_cos_sin_kernel(
+    t_ptr, inv_freq_ptr, cos_ptr, sin_ptr,
+    seq_len, dim: tl.constexpr,
+    stride_t, stride_f, stride_c, stride_s
+):
     seq_id = tl.program_id(0)
     dim_id = tl.arange(0, dim)
 
     # Load time steps and inverse frequency
     t = tl.load(t_ptr + seq_id * stride_t)
-    inv_freq = tl.load(inv_freq_ptr + dim_id)
+    inv_freq = tl.load(inv_freq_ptr + dim_id * stride_f)
 
     # Compute frequency products
     freqs = t * inv_freq
 
     # Calculate cos and sin
-    cos = tl.math.cos(freqs)
-    sin = tl.math.sin(freqs)
+    cos = tl.cos(freqs)
+    sin = tl.sin(freqs)
 
     # Store the results in the output buffers
-    tl.store(cos_ptr + seq_id * stride_c + dim_id, cos)
-    tl.store(sin_ptr + seq_id * stride_s + dim_id, sin)
+    tl.store(cos_ptr + seq_id * stride_c + dim_id * stride_c, cos)
+    tl.store(sin_ptr + seq_id * stride_s + dim_id * stride_s, sin)
 
 
 class LlamaRotaryEmbedding(torch.nn.Module):
