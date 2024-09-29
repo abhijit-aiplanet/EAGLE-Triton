@@ -304,21 +304,17 @@ class LlamaRotaryEmbedding(torch.nn.Module):
 
 # Triton kernel for computing cos and sin cache with scaling factor
 @triton.jit
-def compute_rotary_cos_sin_scaling_kernel(t_ptr, inv_freq_ptr, scaling_factor, cos_ptr, sin_ptr, seq_len, dim tl.constexpr, stride_t, stride_f, stride_c, stride_s):
+def compute_rotary_cos_sin_scaling_kernel(t_ptr, inv_freq_ptr, scaling_factor, cos_ptr, sin_ptr, seq_len, dim: tl.constexpr, stride_t, stride_f, stride_c, stride_s):
     seq_id = tl.program_id(0)
     dim_id = tl.arange(0, dim)
-
     # Load time steps and inverse frequency
-    t = tl.load(t_ptr + seq_id * stride_t) / scaling_factor
+    t = tl.load(t_ptr + seq_id * stride_t)
     inv_freq = tl.load(inv_freq_ptr + dim_id)
-
-    # Compute frequency products
-    freqs = t * inv_freq
-
+    # Compute frequency products with scaling
+    freqs = t * inv_freq * scaling_factor
     # Calculate cos and sin
     cos = tl.cos(freqs)
     sin = tl.sin(freqs)
-
     # Store the results in the output buffers
     tl.store(cos_ptr + seq_id * stride_c + dim_id, cos)
     tl.store(sin_ptr + seq_id * stride_s + dim_id, sin)
