@@ -232,6 +232,9 @@ class LlamaRMSNorm(nn.Module):
 
         return normed_states.to(input_dtype)  # Convert back to original dtype if needed
 
+import torch
+import triton
+import triton.language as tl
 
 @triton.jit
 def rotary_embedding_kernel(
@@ -254,13 +257,16 @@ def rotary_embedding_kernel(
     # Load emb values
     emb_val = tl.load(emb_ptr + offset, mask=dim_idx < dim)
     
-    # Calculate cosine and sine
-    cos_val = tl.cos(emb_val)
-    sin_val = tl.sin(emb_val)
+    # Cast to float32 for computation
+    emb_val_f32 = emb_val.to(tl.float32)
     
-    # Store the calculated cos and sin values
-    tl.store(cos_ptr + offset, cos_val, mask=dim_idx < dim)
-    tl.store(sin_ptr + offset, sin_val, mask=dim_idx < dim)
+    # Calculate cosine and sine
+    cos_val = tl.cos(emb_val_f32)
+    sin_val = tl.sin(emb_val_f32)
+    
+    # Store the calculated cos and sin values (casting back to original dtype)
+    tl.store(cos_ptr + offset, cos_val.to(emb_val.dtype), mask=dim_idx < dim)
+    tl.store(sin_ptr + offset, sin_val.to(emb_val.dtype), mask=dim_idx < dim)
 
 class LlamaRotaryEmbedding(torch.nn.Module):
     def __init__(self, dim, max_position_embeddings=2048, base=10000, device=None):
@@ -272,10 +278,12 @@ class LlamaRotaryEmbedding(torch.nn.Module):
             self.base ** (torch.arange(0, self.dim, 2).float().to(device) / self.dim)
         )
         self.register_buffer("inv_freq", inv_freq)
+        
+        # Initialize with float32, we'll convert to the appropriate dtype in _set_cos_sin_cache
         self._set_cos_sin_cache(
             seq_len=max_position_embeddings,
             device=self.inv_freq.device,
-            dtype=torch.get_default_dtype(),
+            dtype=torch.float32,
         )
 
     def _set_cos_sin_cache(self, seq_len, device, dtype):
@@ -284,7 +292,7 @@ class LlamaRotaryEmbedding(torch.nn.Module):
         freqs = torch.einsum("i,j->ij", t, self.inv_freq)
         emb = torch.cat((freqs, freqs), dim=-1).contiguous()
     
-        # Ensure emb is in the correct dtype
+        # Convert to the desired dtype
         emb = emb.to(dtype)
         
         # Allocate memory for cosine and sine buffers
@@ -311,11 +319,16 @@ class LlamaRotaryEmbedding(torch.nn.Module):
         self.register_buffer("sin_cached", sin_cache.unsqueeze(0).unsqueeze(0), persistent=False)
 
     def forward(self, x, seq_len=None):
+        # Ensure that cos_cached and sin_cached are in the same dtype as x
+        if self.cos_cached.dtype != x.dtype:
+            self._set_cos_sin_cache(seq_len=self.max_seq_len_cached, device=x.device, dtype=x.dtype)
+        
         if seq_len > self.max_seq_len_cached:
             self._set_cos_sin_cache(seq_len=seq_len, device=x.device, dtype=x.dtype)
+        
         return (
-            self.cos_cached[:, :, :seq_len, ...].to(dtype=x.dtype),
-            self.sin_cached[:, :, :seq_len, ...].to(dtype=x.dtype),
+            self.cos_cached[:, :, :seq_len, ...],
+            self.sin_cached[:, :, :seq_len, ...],
         )
 
 
