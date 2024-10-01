@@ -40,64 +40,52 @@ import triton.language as tl
 
 
 @triton.jit
-def causal_mask_kernel(mask_ptr, tgt_len, BLOCK_SIZE: tl.constexpr):
-    row_idx = tl.program_id(0)  # Get the row index for the mask
-    col_idx = tl.arange(0, BLOCK_SIZE)  # Get a block of column indices
-
-    # Create the causal condition: col_idx should be >= row_idx (this ensures lower triangle)
-    causal_condition = col_idx >= row_idx
-
-    # Triton doesn't support torch.finfo, so we manually use the minimum float32 value
-    min_float32 = -3.4e38
-
-    # Store 0.0 where causal condition is True, otherwise store min_float32
-    mask_val = tl.where(causal_condition, 0.0, min_float32).to(tl.float32)
-
-    # Compute the correct offset for the pointer
-    offset = row_idx * tgt_len + col_idx
-    tl.store(mask_ptr + offset, mask_val)
-
-
-
-def _make_causal_mask(
-        input_ids_shape: torch.Size,
-        dtype: torch.dtype,
-        device: torch.device,
-        past_key_values_length: int = 0,
+def causal_mask_kernel(
+    mask_ptr, tgt_len, 
+    BLOCK_SIZE: tl.constexpr
 ):
-    """
-    Create a causal mask for bi-directional self-attention using Triton.
+    row_idx = tl.program_id(0)
+    col_start = tl.program_id(1) * BLOCK_SIZE
+    col_offsets = tl.arange(0, BLOCK_SIZE)
+    
+    cols = col_start + col_offsets
 
-    Args:
-        input_ids_shape (torch.Size): The shape of input_ids tensor, typically (batch_size, tgt_len).
-        dtype (torch.dtype): The data type of the mask.
-        device (torch.device): The device on which the mask will be placed.
-        past_key_values_length (int, optional): The length of past key values. Default is 0.
+    mask = cols >= row_idx
 
-    Returns:
-        torch.Tensor: The causal mask tensor.
-    """
+    min_float32 = -3.4e38
+    mask_val = tl.where(mask, 0.0, min_float32)
+
+    row_start_ptr = mask_ptr + row_idx * tgt_len
+    tl.store(row_start_ptr + cols, mask_val, mask=cols < tgt_len)
+
+def make_causal_mask(
+    input_ids_shape: torch.Size,
+    dtype: torch.dtype,
+    device: torch.device,
+    past_key_values_length: int = 0,
+):
     bsz, tgt_len = input_ids_shape
-    mask = torch.empty((tgt_len, tgt_len), dtype=dtype, device=device)
+    mask = torch.empty((tgt_len, tgt_len), dtype=torch.float32, device=device)
     
-    BLOCK_SIZE = 1024  # Define block size for Triton kernel (you can tune this for your hardware)
-    grid = lambda meta: (tgt_len + BLOCK_SIZE - 1) // BLOCK_SIZE  # Grid size for parallelization
+    BLOCK_SIZE = 1024
+    grid = (tgt_len, (tgt_len + BLOCK_SIZE - 1) // BLOCK_SIZE)
     
-    # Launch Triton kernel for creating the mask
     causal_mask_kernel[grid](
         mask.data_ptr(), tgt_len, BLOCK_SIZE
     )
 
     if past_key_values_length > 0:
         past_mask = torch.zeros(
-            tgt_len, past_key_values_length, dtype=dtype, device=device
+            tgt_len, past_key_values_length, dtype=torch.float32, device=device
         )
         mask = torch.cat([past_mask, mask], dim=-1)
+
+    # Convert to the desired dtype after all computations
+    mask = mask.to(dtype)
 
     return mask[None, None, :, :].expand(
         bsz, 1, tgt_len, tgt_len + past_key_values_length
     )
-
 
 # Triton kernel for expanding the attention mask
 @triton.jit
