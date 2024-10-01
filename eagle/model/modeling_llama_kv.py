@@ -738,7 +738,8 @@ def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
 @triton.jit
 def linear_proj_kernel(
     x_ptr, weight_ptr, out_ptr, 
-    in_features, out_features, 
+    in_features: tl.constexpr, 
+    out_features, 
     BLOCK_SIZE: tl.constexpr
 ):
     # Compute sequence index and dimension indices
