@@ -44,12 +44,13 @@ import triton.language as tl
 def causal_mask_kernel(mask_ptr, tgt_len, BLOCK_SIZE: tl.constexpr):
     row_idx = tl.program_id(0)  # Get the row index for the mask
     col_idx = tl.arange(0, BLOCK_SIZE)  # Get a block of column indices
-    mask_cond = tl.arange(0, tgt_len)  # Condition array [0, 1, 2, ..., tgt_len-1]
-
-    # Fill the mask with the minimum value of the dtype where causal condition is met
-    causal_value = mask_cond < (mask_cond + 1).view(tgt_len, 1)
-    # Convert to 0 or dtype.min where causal condition isn't met
-    mask_val = tl.where(causal_value, 0.0, torch.finfo(torch.float32).min)
+    # Create the causal condition: col_idx should be >= row_idx (this ensures lower triangle)
+    causal_condition = col_idx >= row_idx
+    # Triton doesn't support torch.finfo, so we manually use the minimum float32 value
+    min_float32 = -3.4e38
+    # Store 0.0 where causal condition is True, otherwise store min_float32
+    mask_val = tl.where(causal_condition, 0.0, min_float32)
+    # Store the computed mask in the mask_ptr
     tl.store(mask_ptr + row_idx * tgt_len + col_idx, mask_val)
 
 
