@@ -734,24 +734,32 @@ def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
     return output
 
 
-
 @triton.jit
 def linear_proj_kernel(x_ptr, weight_ptr, out_ptr, in_features, out_features, BLOCK_SIZE: tl.constexpr):
     seq_idx = tl.program_id(0)  # Sequence index
     dim_idx = tl.arange(0, BLOCK_SIZE)  # Block of dimensions for parallelism
     
-    # Load input tensor (1D slice corresponding to a single sequence, in_features long)
+    # Load input tensor (1D slice corresponding to a single sequence, reshape to 2D)
     x_val = tl.load(x_ptr + seq_idx * in_features + dim_idx, mask=dim_idx < in_features)
     
-    # Perform matrix multiplication
-    result = tl.zeros([BLOCK_SIZE], dtype=tl.float32)  # Initialize the result vector
-    
-    for i in range(0, out_features, BLOCK_SIZE):  # Iterate over output features in blocks
-        weight = tl.load(weight_ptr + i * in_features + dim_idx, mask=dim_idx < in_features)  # Load weight slice
-        result += tl.dot(x_val, weight)  # Perform dot product for this block of out_features
+    # Reshape x_val into a 2D matrix (1 row by in_features columns)
+    x_val = tl.reshape(x_val, (1, in_features))
 
-    # Store result in the output tensor
+    # Initialize the output result
+    result = tl.zeros([1, out_features], dtype=tl.float32)
+
+    # Perform matrix multiplication
+    for i in range(0, out_features, BLOCK_SIZE):  # Iterate over output features in blocks
+        # Load weight slice (reshaped to be 2D with in_features rows)
+        weight = tl.load(weight_ptr + i * in_features + dim_idx, mask=dim_idx < in_features)
+        weight = tl.reshape(weight, (in_features, BLOCK_SIZE))  # Reshape weight into 2D matrix
+        
+        # Perform matrix multiplication (dot product between x_val and weight)
+        result += tl.dot(x_val, weight)
+    
+    # Store the result in the output tensor
     tl.store(out_ptr + seq_idx * out_features + dim_idx, result, mask=dim_idx < out_features)
+
 
 
 
