@@ -604,8 +604,8 @@ def mlp_kernel(x_ptr, gate_proj_ptr, up_proj_ptr, down_proj_ptr, act_fn, interme
     x_val = tl.load(x_ptr + seq_idx * hidden_size + dim_idx, mask=dim_idx < hidden_size)
 
     # Apply gate_proj and up_proj (linear layers)
-    gate_proj_val = tl.dot(x_val, gate_proj_ptr + dim_idx, mask=dim_idx < intermediate_size)
-    up_proj_val = tl.dot(x_val, up_proj_ptr + dim_idx, mask=dim_idx < intermediate_size)
+    gate_proj_val = tl.dot(x_val, gate_proj_ptr + dim_idx)
+    up_proj_val = tl.dot(x_val, up_proj_ptr + dim_idx)
 
     # Apply activation function
     if act_fn == 'relu':
@@ -617,7 +617,7 @@ def mlp_kernel(x_ptr, gate_proj_ptr, up_proj_ptr, down_proj_ptr, act_fn, interme
     intermediate_val = gate_proj_val * up_proj_val
 
     # Apply down_proj (linear layer)
-    down_proj_val = tl.dot(intermediate_val, down_proj_ptr + dim_idx, mask=dim_idx < hidden_size)
+    down_proj_val = tl.dot(intermediate_val, down_proj_ptr + dim_idx)
 
     # Store result back into the output tensor
     tl.store(x_ptr + seq_idx * hidden_size + dim_idx, down_proj_val, mask=dim_idx < hidden_size)
@@ -747,7 +747,7 @@ def linear_proj_kernel(x_ptr, weight_ptr, out_ptr, in_features, out_features, BL
     x_val = tl.load(x_ptr + seq_idx * in_features + dim_idx, mask=dim_idx < in_features)
 
     # Perform matrix multiplication (dot product with weight)
-    result = tl.dot(x_val, weight_ptr + dim_idx, mask=dim_idx < out_features)
+    result = tl.dot(x_val, weight_ptr + dim_idx)
 
     # Store result in the output tensor
     tl.store(out_ptr + seq_idx * out_features + dim_idx, result, mask=dim_idx < out_features)
