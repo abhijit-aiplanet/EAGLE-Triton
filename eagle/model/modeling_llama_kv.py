@@ -39,7 +39,7 @@ import triton
 import triton.language as tl
 
 
-@@triton.jit
+@triton.jit
 def causal_mask_kernel(mask_ptr, tgt_len, BLOCK_SIZE: tl.constexpr):
     row_idx = tl.program_id(0)  # Get the row index for the mask
     col_idx = tl.arange(0, BLOCK_SIZE)  # Get a block of column indices
