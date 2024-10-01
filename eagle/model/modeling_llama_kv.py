@@ -135,7 +135,7 @@ def _expand_mask(mask: torch.Tensor, dtype: torch.dtype, tgt_len: Optional[int] 
 
     # Launch Triton kernel for expanding the mask
     expand_mask_kernel[grid](
-        expanded_mask.data_ptr(), mask.data_ptr(), src_len, tgt_len, bsz, BLOCK_SIZE
+        expanded_mask, mask, src_len, tgt_len, bsz, BLOCK_SIZE
     )
 
     # Invert the mask (this part does not need Triton as it's a simple operation)
