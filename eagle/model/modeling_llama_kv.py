@@ -40,24 +40,23 @@ import torch
 
 @triton.jit
 def causal_mask_kernel(
-    mask_ptr, 
+    mask, 
     tgt_len,
     BLOCK_SIZE: tl.constexpr
 ):
     row_idx = tl.program_id(0)
-    col_start = tl.program_id(1) * BLOCK_SIZE
-    
-    mask_ptr = mask_ptr + row_idx * tgt_len + col_start
-    
     col_offsets = tl.arange(0, BLOCK_SIZE)
-    cols = col_start + col_offsets
-    
-    mask = cols >= row_idx
-    
-    min_float32 = -3.4e38
-    mask_val = tl.where(mask, 0.0, min_float32)
-    
-    tl.store(mask_ptr + col_offsets, mask_val, mask=cols < tgt_len)
+    col_idx = tl.program_id(1) * BLOCK_SIZE + col_offsets
+
+    # Compute mask values based on causal condition
+    mask_vals = tl.where(col_idx >= row_idx, 0.0, -3.4e38)
+
+    # Compute the linear offsets into the mask tensor
+    offsets = row_idx * tgt_len + col_idx
+
+    # Store the mask values at the computed offsets
+    tl.store(mask + offsets, mask_vals, mask=col_idx < tgt_len)
+
 
 def _make_causal_mask(
     input_ids_shape: torch.Size,
@@ -72,7 +71,7 @@ def _make_causal_mask(
     grid = (tgt_len, (tgt_len + BLOCK_SIZE - 1) // BLOCK_SIZE)
     
     causal_mask_kernel[grid](
-        mask.data_ptr(), 
+        mask, 
         tgt_len,
         BLOCK_SIZE
     )
