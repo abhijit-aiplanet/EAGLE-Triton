@@ -34,29 +34,30 @@ logger = logging.get_logger(__name__)
 _CONFIG_FOR_DOC = "LlamaConfig"
 
 
-import torch
 import triton
 import triton.language as tl
-
+import torch
 
 @triton.jit
 def causal_mask_kernel(
-    mask_ptr, tgt_len, 
+    mask_ptr, 
+    tgt_len,
     BLOCK_SIZE: tl.constexpr
 ):
     row_idx = tl.program_id(0)
     col_start = tl.program_id(1) * BLOCK_SIZE
-    col_offsets = tl.arange(0, BLOCK_SIZE)
     
+    mask_ptr = mask_ptr + row_idx * tgt_len + col_start
+    
+    col_offsets = tl.arange(0, BLOCK_SIZE)
     cols = col_start + col_offsets
-
+    
     mask = cols >= row_idx
-
+    
     min_float32 = -3.4e38
     mask_val = tl.where(mask, 0.0, min_float32)
-
-    row_start_ptr = mask_ptr + row_idx * tgt_len
-    tl.store(row_start_ptr + cols, mask_val, mask=cols < tgt_len)
+    
+    tl.store(mask_ptr + col_offsets, mask_val, mask=cols < tgt_len)
 
 def _make_causal_mask(
     input_ids_shape: torch.Size,
@@ -71,18 +72,20 @@ def _make_causal_mask(
     grid = (tgt_len, (tgt_len + BLOCK_SIZE - 1) // BLOCK_SIZE)
     
     causal_mask_kernel[grid](
-        mask.data_ptr(), tgt_len, BLOCK_SIZE
+        mask.data_ptr(), 
+        tgt_len,
+        BLOCK_SIZE
     )
-
+    
     if past_key_values_length > 0:
         past_mask = torch.zeros(
-            tgt_len, past_key_values_length, dtype=torch.float32, device=device
+            (tgt_len, past_key_values_length), dtype=torch.float32, device=device
         )
         mask = torch.cat([past_mask, mask], dim=-1)
-
+    
     # Convert to the desired dtype after all computations
     mask = mask.to(dtype)
-
+    
     return mask[None, None, :, :].expand(
         bsz, 1, tgt_len, tgt_len + past_key_values_length
     )
