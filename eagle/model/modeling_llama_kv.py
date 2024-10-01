@@ -1030,7 +1030,7 @@ class LlamaDecoderLayer(nn.Module):
             hidden_states.data_ptr(),
             normalized_hidden_states.data_ptr(),
             self.input_layernorm.weight.data_ptr(),
-            self.input_layernorm.bias.data_ptr(),
+            None,
             self.input_layernorm.variance_epsilon,
             hidden_size,
             BLOCK_SIZE
@@ -1054,7 +1054,7 @@ class LlamaDecoderLayer(nn.Module):
             hidden_states.data_ptr(),
             normalized_hidden_states.data_ptr(),
             self.post_attention_layernorm.weight.data_ptr(),
-            self.post_attention_layernorm.bias.data_ptr(),
+            None,
             self.post_attention_layernorm.variance_epsilon,
             hidden_size,
             BLOCK_SIZE
