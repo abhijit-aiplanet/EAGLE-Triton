@@ -39,7 +39,7 @@ import triton
 import triton.language as tl
 
 
-@triton.jit
+@@triton.jit
 def causal_mask_kernel(mask_ptr, tgt_len, BLOCK_SIZE: tl.constexpr):
     row_idx = tl.program_id(0)  # Get the row index for the mask
     col_idx = tl.arange(0, BLOCK_SIZE)  # Get a block of column indices
@@ -53,9 +53,9 @@ def causal_mask_kernel(mask_ptr, tgt_len, BLOCK_SIZE: tl.constexpr):
     # Store 0.0 where causal condition is True, otherwise store min_float32
     mask_val = tl.where(causal_condition, 0.0, min_float32).to(tl.float32)
 
-    # Store the computed mask in the mask_ptr (casting the pointer to float32)
-    mask_ptr = mask_ptr.to(tl.float32)  # Cast pointer to float32 type
-    tl.store(mask_ptr + row_idx * tgt_len + col_idx, mask_val)
+    # Compute the correct offset for the pointer
+    offset = row_idx * tgt_len + col_idx
+    tl.store(mask_ptr + offset, mask_val)
 
 
 
