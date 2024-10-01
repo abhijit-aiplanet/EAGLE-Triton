@@ -965,12 +965,16 @@ def layernorm_kernel(x_ptr, out_ptr, weight_ptr, bias_ptr, epsilon, hidden_size,
     dim_idx = tl.arange(0, BLOCK_SIZE)
 
     x = tl.load(x_ptr + batch_idx * hidden_size + dim_idx, mask=dim_idx < hidden_size)
-    
-    mean = tl.sum(x, axis=0) / hidden_size
+
+    # Cast hidden_size and epsilon to Triton tensors
+    hidden_size_t = tl.float32(hidden_size)
+    epsilon_t = tl.float32(epsilon)
+
+    mean = tl.sum(x, axis=0) / hidden_size_t
     x_mean_sub = x - mean
-    var = tl.sum(x_mean_sub * x_mean_sub, axis=0) / hidden_size
-    inv_std = 1.0 / tl.sqrt(var + epsilon)  # var is already a scalar, no need for tl.load()
-    
+    var = tl.sum(x_mean_sub * x_mean_sub, axis=0) / hidden_size_t
+    inv_std = tl.float32(1.0) / tl.sqrt(var + epsilon_t)
+
     norm_x = x_mean_sub * inv_std
     if weight_ptr:
         weight = tl.load(weight_ptr + dim_idx, mask=dim_idx < hidden_size)
@@ -978,8 +982,10 @@ def layernorm_kernel(x_ptr, out_ptr, weight_ptr, bias_ptr, epsilon, hidden_size,
     if bias_ptr:
         bias = tl.load(bias_ptr + dim_idx, mask=dim_idx < hidden_size)
         norm_x = norm_x + bias
-    
+
+    # Store the result back to memory
     tl.store(out_ptr + batch_idx * hidden_size + dim_idx, norm_x, mask=dim_idx < hidden_size)
+
 
 
 class LlamaDecoderLayer(nn.Module):
