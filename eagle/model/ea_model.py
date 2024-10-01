@@ -110,12 +110,10 @@ class EaModel(nn.Module):
 
         try:
             load_model_path=os.path.join(ea_model_path, "pytorch_model.bin")
-            print("hello")
             if not os.path.exists(load_model_path):
                 load_model_path=hf_hub_download(ea_model_path, "pytorch_model.bin")
             ea_layer_state_dict = torch.load(load_model_path,
                                              map_location=base_model.device)
-            print(f"{load_model_path}........{ea_layer_state_dict}")
         except:
             from safetensors.torch import load_file
             load_model_path = os.path.join(ea_model_path, "model.safetensors")
