@@ -735,22 +735,35 @@ def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
 
 
 
-
-
-# Triton kernel for linear projections (q_proj, k_proj, v_proj)
 @triton.jit
-def linear_proj_kernel(x_ptr, weight_ptr, out_ptr, in_features, out_features, BLOCK_SIZE: tl.constexpr):
-    seq_idx = tl.program_id(0)  # Sequence index
-    dim_idx = tl.arange(0, BLOCK_SIZE)  # Block of dimensions for parallelism
-
-    # Load input tensor
-    x_val = tl.load(x_ptr + seq_idx * in_features + dim_idx, mask=dim_idx < in_features)
-
-    # Perform matrix multiplication (dot product with weight)
-    result = tl.dot(x_val, tl.load(weight_ptr) + dim_idx)
-
-    # Store result in the output tensor
-    tl.store(out_ptr + seq_idx * out_features + dim_idx, result, mask=dim_idx < out_features)
+def linear_proj_kernel(
+    x_ptr, weight_ptr, out_ptr, 
+    in_features, out_features, 
+    BLOCK_SIZE: tl.constexpr
+):
+    # Compute sequence index and dimension indices
+    seq_idx = tl.program_id(0)
+    out_dim_idx = tl.arange(0, BLOCK_SIZE)
+    
+    # Load input vector
+    x_val = tl.load(x_ptr + seq_idx * in_features + tl.arange(0, in_features), 
+                    mask=tl.arange(0, in_features) < in_features)
+    
+    # Compute output
+    acc = tl.zeros((BLOCK_SIZE,), dtype=tl.float32)
+    for in_dim in range(0, in_features, BLOCK_SIZE):
+        in_dim_idx = tl.arange(0, BLOCK_SIZE) + in_dim
+        weight_val = tl.load(
+            weight_ptr + out_dim_idx[:, None] * in_features + in_dim_idx[None, :],
+            mask=(out_dim_idx[:, None] < out_features) & (in_dim_idx[None, :] < in_features)
+        )
+        x_block = tl.load(x_ptr + seq_idx * in_features + in_dim_idx, 
+                          mask=in_dim_idx < in_features)
+        acc += tl.sum(weight_val * x_block[None, :], axis=1)
+    
+    # Store the result
+    tl.store(out_ptr + seq_idx * out_features + out_dim_idx, acc, 
+             mask=out_dim_idx < out_features)
 
 
 # Triton kernel for attention weights calculation (query * key^T)
