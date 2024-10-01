@@ -89,7 +89,6 @@ def _make_causal_mask(
         bsz, 1, tgt_len, tgt_len + past_key_values_length
     )
 
-# Triton kernel for expanding the attention mask
 @triton.jit
 def expand_mask_kernel(
         expanded_mask_ptr, 
@@ -102,50 +101,44 @@ def expand_mask_kernel(
     b_idx = tl.program_id(0)  # Get batch index
     t_idx = tl.program_id(1)  # Get target sequence index
     s_idx = tl.arange(0, BLOCK_SIZE)  # Get a block of source sequence indices
-
+    
     # Compute mask expansion for each batch and target index
     mask_value = tl.load(mask_ptr + b_idx * src_len + s_idx, mask=s_idx < src_len)
-    mask_value = mask_value[:, None].expand(tgt_len, src_len)  # Expand to tgt_len
+    
+    # Instead of using expand, we'll broadcast the mask value to all target indices
     expanded_value = 1.0 - mask_value
-
+    
     # Store the result in the expanded_mask tensor
-    tl.store(expanded_mask_ptr + b_idx * tgt_len * src_len + t_idx * src_len + s_idx, expanded_value, mask=s_idx < src_len)
-
+    tl.store(expanded_mask_ptr + b_idx * tgt_len * src_len + t_idx * src_len + s_idx, 
+             expanded_value, mask=s_idx < src_len)
 
 def _expand_mask(mask: torch.Tensor, dtype: torch.dtype, tgt_len: Optional[int] = None):
     """
     Expand attention_mask from `[bsz, seq_len]` to `[bsz, 1, tgt_seq_len, src_seq_len]` using Triton.
-
     Args:
         mask (torch.Tensor): The attention mask tensor of shape `[bsz, seq_len]`.
         dtype (torch.dtype): The data type of the mask.
         tgt_len (Optional[int], optional): The target sequence length. If None, it defaults to the source sequence length.
-
     Returns:
         torch.Tensor: The expanded mask tensor.
     """
     bsz, src_len = mask.size()
     tgt_len = tgt_len if tgt_len is not None else src_len
-
+    
     # Initialize the expanded mask
     expanded_mask = torch.empty((bsz, tgt_len, src_len), dtype=dtype, device=mask.device)
-
+    
     BLOCK_SIZE = 1024  # Define the block size for the Triton kernel
-    grid = lambda meta: (bsz, tgt_len, (src_len + BLOCK_SIZE - 1) // BLOCK_SIZE)
-
+    grid = lambda meta: (bsz, tgt_len, triton.cdiv(src_len, BLOCK_SIZE))
+    
     # Launch Triton kernel for expanding the mask
     expand_mask_kernel[grid](
         expanded_mask, mask, src_len, tgt_len, bsz, BLOCK_SIZE
     )
-
-    # Invert the mask (this part does not need Triton as it's a simple operation)
-    expanded_mask = expanded_mask.to(dtype)
-    inverted_mask = 1.0 - expanded_mask
-
+    
     # Apply the mask fill (can still use standard PyTorch here)
-    return inverted_mask.masked_fill(inverted_mask.to(torch.bool), torch.finfo(dtype).min)
-
-
+    expanded_mask = expanded_mask.to(dtype)
+    return expanded_mask.masked_fill(expanded_mask.to(torch.bool), torch.finfo(dtype).min)
 
 import torch.nn as nn
 import torch
