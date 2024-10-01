@@ -58,7 +58,7 @@ def causal_mask_kernel(
     row_start_ptr = mask_ptr + row_idx * tgt_len
     tl.store(row_start_ptr + cols, mask_val, mask=cols < tgt_len)
 
-def make_causal_mask(
+def _make_causal_mask(
     input_ids_shape: torch.Size,
     dtype: torch.dtype,
     device: torch.device,
