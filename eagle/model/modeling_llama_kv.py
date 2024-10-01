@@ -736,7 +736,7 @@ def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
 
 
 @triton.jit
-def linear_proj_kernel(x_ptr, weight_ptr, out_ptr, in_features, out_features, BLOCK_SIZE: tl.constexpr):
+def linear_proj_kernel(x_ptr, weight_ptr, out_ptr, in_features, out_features: tl.constexpr, BLOCK_SIZE: tl.constexpr):
     seq_idx = tl.program_id(0)  # Sequence index
     dim_idx = tl.arange(0, BLOCK_SIZE)  # Block of dimensions for parallelism
     
