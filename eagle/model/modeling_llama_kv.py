@@ -969,7 +969,7 @@ def layernorm_kernel(x_ptr, out_ptr, weight_ptr, bias_ptr, epsilon, hidden_size,
     mean = tl.sum(x, axis=0) / hidden_size
     x_mean_sub = x - mean
     var = tl.sum(x_mean_sub * x_mean_sub, axis=0) / hidden_size
-    inv_std = 1.0 / tl.sqrt(var + epsilon)
+    inv_std = 1.0 / tl.sqrt(tl.load(var) + epsilon)  # Load the value from the var pointer
     
     norm_x = x_mean_sub * inv_std
     if weight_ptr:
@@ -978,7 +978,7 @@ def layernorm_kernel(x_ptr, out_ptr, weight_ptr, bias_ptr, epsilon, hidden_size,
     if bias_ptr:
         bias = tl.load(bias_ptr + dim_idx, mask=dim_idx < hidden_size)
         norm_x = norm_x + bias
-
+    
     tl.store(out_ptr + batch_idx * hidden_size + dim_idx, norm_x, mask=dim_idx < hidden_size)
 
 
