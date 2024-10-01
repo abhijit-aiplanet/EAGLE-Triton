@@ -736,21 +736,23 @@ def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
 
 
 @triton.jit
-def linear_proj_kernel(x_ptr, weight_ptr, out_ptr, in_features, out_features: tl.constexpr, BLOCK_SIZE: tl.constexpr):
+def linear_proj_kernel(x_ptr, weight_ptr, out_ptr, in_features, out_features, BLOCK_SIZE: tl.constexpr):
     seq_idx = tl.program_id(0)  # Sequence index
     dim_idx = tl.arange(0, BLOCK_SIZE)  # Block of dimensions for parallelism
     
     # Load input tensor (1D slice corresponding to a single sequence, in_features long)
     x_val = tl.load(x_ptr + seq_idx * in_features + dim_idx, mask=dim_idx < in_features)
     
-    # Load weight tensor as a matrix (ensure correct broadcasting across out_features)
-    weight = tl.load(weight_ptr + dim_idx * out_features + tl.arange(0, out_features), mask=(dim_idx < in_features))
+    # Perform matrix multiplication
+    result = tl.zeros([BLOCK_SIZE], dtype=tl.float32)  # Initialize the result vector
     
-    # Perform matrix-vector multiplication
-    result = tl.dot(x_val, weight)
-    
+    for i in range(0, out_features, BLOCK_SIZE):  # Iterate over output features in blocks
+        weight = tl.load(weight_ptr + i * in_features + dim_idx, mask=dim_idx < in_features)  # Load weight slice
+        result += tl.dot(x_val, weight)  # Perform dot product for this block of out_features
+
     # Store result in the output tensor
     tl.store(out_ptr + seq_idx * out_features + dim_idx, result, mask=dim_idx < out_features)
+
 
 
 
