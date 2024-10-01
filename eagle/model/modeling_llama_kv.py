@@ -211,10 +211,10 @@ class LlamaRMSNorm(nn.Module):
         grid = lambda meta: (hidden_states.size(0),)  # One block per row (batch element)
 
         rms_norm_kernel[grid](
-            hidden_states.data_ptr(),
-            normed_states.data_ptr(),
-            self.weight.data_ptr(),
-            self.variance_epsilon.data_ptr(),
+            hidden_states,
+            normed_states,
+            self.weight,
+            self.variance_epsilon,
             self.hidden_size,
             BLOCK_SIZE
         )
@@ -415,9 +415,9 @@ class LlamaLinearScalingRotaryEmbedding(LlamaRotaryEmbedding):
 
         # Launch the Triton kernel to calculate cos and sin embeddings with scaling
         linear_scaling_rotary_embedding_kernel[grid](
-            emb.data_ptr(), 
-            cos_cache.data_ptr(), 
-            sin_cache.data_ptr(), 
+            emb, 
+            cos_cache, 
+            sin_cache, 
             seq_len, 
             self.dim, 
             self.scaling_factor,
@@ -582,11 +582,11 @@ def apply_rotary_pos_emb_triton(q, k, cos, sin, position_ids):
 
     # Apply rotary embeddings using Triton
     rotary_pos_emb_kernel[grid](
-        q.data_ptr(),
-        k.data_ptr(),
-        cos.data_ptr(),
-        sin.data_ptr(),
-        position_ids.data_ptr(),
+        q,
+        k,
+        cos,
+        sin,
+        position_ids,
         embed_dim,
         BLOCK_SIZE
     )
@@ -669,10 +669,10 @@ class LlamaMLP(nn.Module):
         else:
             # Use Triton for the main MLP operations
             mlp_kernel[grid](
-                x.data_ptr(),
-                self.gate_proj.weight.data_ptr(),
-                self.up_proj.weight.data_ptr(),
-                self.down_proj.weight.data_ptr(),
+                x,
+                self.gate_proj.weight,
+                self.up_proj.weight,
+                self.down_proj.weight,
                 self.act_fn,
                 self.intermediate_size,
                 self.hidden_size,
@@ -722,8 +722,8 @@ def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
 
     # Launch Triton kernel to perform the repetition
     repeat_kv_kernel[grid](
-        hidden_states.data_ptr(),
-        output.data_ptr(),
+        hidden_states,
+        output,
         num_key_value_heads,
         slen,
         head_dim,
@@ -886,27 +886,27 @@ class LlamaAttention(nn.Module):
             value_states = torch.empty((bsz, q_len, self.num_key_value_heads * self.head_dim), device=hidden_states.device, dtype=hidden_states.dtype)
 
             linear_proj_kernel[grid](
-                hidden_states.data_ptr(),
-                self.q_proj.weight.data_ptr(),
-                query_states.data_ptr(),
+                hidden_states,
+                self.q_proj.weight,
+                query_states,
                 self.hidden_size,
                 self.num_heads * self.head_dim,
                 BLOCK_SIZE
             )
 
             linear_proj_kernel[grid](
-                hidden_states.data_ptr(),
-                self.k_proj.weight.data_ptr(),
-                key_states.data_ptr(),
+                hidden_states,
+                self.k_proj.weight,
+                key_states,
                 self.hidden_size,
                 self.num_key_value_heads * self.head_dim,
                 BLOCK_SIZE
             )
 
             linear_proj_kernel[grid](
-                hidden_states.data_ptr(),
-                self.v_proj.weight.data_ptr(),
-                value_states.data_ptr(),
+                hidden_states,
+                self.v_proj.weight,
+                value_states,
                 self.hidden_size,
                 self.num_key_value_heads * self.head_dim,
                 BLOCK_SIZE
@@ -930,9 +930,9 @@ class LlamaAttention(nn.Module):
         attn_weights = torch.empty((bsz, self.num_heads, q_len, kv_seq_len), device=hidden_states.device, dtype=hidden_states.dtype)
 
         attn_weights_kernel[grid](
-            query_states.data_ptr(),
-            key_states.data_ptr(),
-            attn_weights.data_ptr(),
+            query_states,
+            key_states,
+            attn_weights,
             self.head_dim,
             BLOCK_SIZE
         )
@@ -1027,9 +1027,9 @@ class LlamaDecoderLayer(nn.Module):
         BLOCK_SIZE = 1024  # Adjust block size for performance
         grid = lambda meta: (bsz,)
         layernorm_kernel[grid](
-            hidden_states.data_ptr(),
-            normalized_hidden_states.data_ptr(),
-            self.input_layernorm.weight.data_ptr(),
+            hidden_states,
+            normalized_hidden_states,
+            self.input_layernorm.weight,
             None,
             self.input_layernorm.variance_epsilon,
             hidden_size,
@@ -1051,9 +1051,9 @@ class LlamaDecoderLayer(nn.Module):
         residual = hidden_states
         normalized_hidden_states = torch.empty_like(hidden_states)
         layernorm_kernel[grid](
-            hidden_states.data_ptr(),
-            normalized_hidden_states.data_ptr(),
-            self.post_attention_layernorm.weight.data_ptr(),
+            hidden_states,
+            normalized_hidden_states,
+            self.post_attention_layernorm.weight,
             None,
             self.post_attention_layernorm.variance_epsilon,
             hidden_size,
