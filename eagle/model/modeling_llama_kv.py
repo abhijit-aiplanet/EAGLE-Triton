@@ -747,7 +747,7 @@ def linear_proj_kernel(x_ptr, weight_ptr, out_ptr, in_features, out_features, BL
     x_val = tl.load(x_ptr + seq_idx * in_features + dim_idx, mask=dim_idx < in_features)
 
     # Perform matrix multiplication (dot product with weight)
-    result = tl.dot(x_val, tl.load(weight_ptr) + tl.load(dim_idx))
+    result = tl.dot(x_val, tl.load(weight_ptr) + dim_idx)
 
     # Store result in the output tensor
     tl.store(out_ptr + seq_idx * out_features + dim_idx, result, mask=dim_idx < out_features)
