@@ -753,7 +753,7 @@ def linear_proj_kernel(
     for i in range(0, out_features, BLOCK_SIZE):
         # Compute current output block size
         current_block_size = min(BLOCK_SIZE, out_features - i)
-        
+        current_block_size: tl.constexpr
         # Load weight slice
         weight = tl.load(
             weight_ptr + i * in_features + tl.arange(0, in_features)[:, None] * out_features + tl.arange(0, current_block_size)[None, :],
