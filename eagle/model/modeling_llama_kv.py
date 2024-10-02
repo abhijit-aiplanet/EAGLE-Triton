@@ -453,26 +453,31 @@ class LlamaLinearScalingRotaryEmbedding(LlamaRotaryEmbedding):
 def rotary_pos_emb_kernel(q_ptr, k_ptr, cos_ptr, sin_ptr, position_ids_ptr, embed_dim, BLOCK_SIZE: tl.constexpr):
     seq_idx = tl.program_id(0)  # Sequence index for each batch
     dim_idx = tl.arange(0, BLOCK_SIZE)  # Dimension index block for parallelism
-
+    
     # Load query and key values
     q_val = tl.load(q_ptr + seq_idx * embed_dim + dim_idx, mask=dim_idx < embed_dim)
     k_val = tl.load(k_ptr + seq_idx * embed_dim + dim_idx, mask=dim_idx < embed_dim)
-
+    
     # Load cosine and sine values for the current position
-    cos_val = tl.load(cos_ptr + tl.load(position_ids_ptr + seq_idx) * embed_dim + dim_idx, mask=dim_idx < embed_dim)
-    sin_val = tl.load(sin_ptr + tl.load(position_ids_ptr + seq_idx) * embed_dim + dim_idx, mask=dim_idx < embed_dim)
-
+    position_id = tl.load(position_ids_ptr + seq_idx)
+    cos_val = tl.load(cos_ptr + position_id * embed_dim + dim_idx, mask=dim_idx < embed_dim)
+    sin_val = tl.load(sin_ptr + position_id * embed_dim + dim_idx, mask=dim_idx < embed_dim)
+    
     # Rotate half the dimensions of the query and key tensors
     half = embed_dim // 2
-    q1 = q_val[..., :half]
-    q2 = q_val[..., half:]
-    k1 = k_val[..., :half]
-    k2 = k_val[..., half:]
-
+    q1 = tl.where(dim_idx < half, q_val, 0)
+    q2 = tl.where(dim_idx >= half, q_val, 0)
+    k1 = tl.where(dim_idx < half, k_val, 0)
+    k2 = tl.where(dim_idx >= half, k_val, 0)
+    
     # Apply rotary embeddings
-    q_embed = (q1 * cos_val[:half]) + (-q2 * sin_val[:half])
-    k_embed = (k1 * cos_val[:half]) + (-k2 * sin_val[:half])
-
+    q_embed = tl.where(dim_idx < half, 
+                       q1 * cos_val + tl.where(dim_idx + half < embed_dim, -q2, 0) * sin_val,
+                       q_val)
+    k_embed = tl.where(dim_idx < half, 
+                       k1 * cos_val + tl.where(dim_idx + half < embed_dim, -k2, 0) * sin_val,
+                       k_val)
+    
     # Store the updated query and key embeddings
     tl.store(q_ptr + seq_idx * embed_dim + dim_idx, q_embed, mask=dim_idx < embed_dim)
     tl.store(k_ptr + seq_idx * embed_dim + dim_idx, k_embed, mask=dim_idx < embed_dim)
