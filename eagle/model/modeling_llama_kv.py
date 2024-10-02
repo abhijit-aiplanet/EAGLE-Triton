@@ -738,27 +738,24 @@ def linear_proj_kernel(x_ptr, weight_ptr, out_ptr, in_features: tl.constexpr, ou
     seq_idx = tl.program_id(0)  # Sequence index
     dim_idx = tl.arange(0, BLOCK_SIZE)  # Block of dimensions for parallelism
     
-    # Load input tensor (1D slice corresponding to a single sequence)
+    # Load input tensor (reshape to 2D for matrix multiplication)
     x_val = tl.load(x_ptr + seq_idx * in_features + dim_idx, mask=dim_idx < in_features, other=0.0)
+    x_val = tl.reshape(x_val, (1, in_features))  # Reshape to 2D (1 x in_features)
     
     # Initialize the output result (result will have 1 row and out_features columns)
     result = tl.zeros([BLOCK_SIZE], dtype=tl.float32)
     
     # Perform matrix multiplication
     for i in range(0, out_features, BLOCK_SIZE):  # Iterate over output features in blocks
-        # Load weight slice (reshaped to be 2D with in_features rows)
+        # Load weight slice and reshape to 2D for dot product
         weight = tl.load(weight_ptr + i * in_features + dim_idx, mask=dim_idx < in_features, other=0.0)
+        weight = tl.reshape(weight, (in_features, 1))  # Reshape to 2D (in_features x 1)
         
         # Compute dot product for the block
         result += tl.dot(x_val, weight)
     
     # Store the result in the output tensor
     tl.store(out_ptr + seq_idx * out_features + dim_idx, result, mask=dim_idx < out_features)
-
-
-
-
-
 
 # Triton kernel for attention weights calculation (query * key^T)
 @triton.jit
