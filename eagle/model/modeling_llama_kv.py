@@ -784,20 +784,46 @@ def linear_proj_kernel(
 
 # Triton kernel for attention weights calculation (query * key^T)
 @triton.jit
-def attn_weights_kernel(query_ptr, key_ptr, out_ptr, head_dim, BLOCK_SIZE: tl.constexpr):
-    batch_idx = tl.program_id(0)  # Batch index
-    seq_idx = tl.program_id(1)  # Sequence index
-    dim_idx = tl.arange(0, BLOCK_SIZE)  # Block of dimensions for parallelism
-
-    # Load query and key
-    query_val = tl.load(query_ptr + batch_idx * head_dim + dim_idx, mask=dim_idx < head_dim)
-    key_val = tl.load(key_ptr + seq_idx * head_dim + dim_idx, mask=dim_idx < head_dim)
-
-    # Compute attention weights (dot product)
-    result = tl.dot(query_val, key_val)
-
-    # Store the result in the output tensor
-    tl.store(out_ptr + batch_idx * head_dim + seq_idx, result)
+def attn_weights_kernel(
+    query_ptr, key_ptr, out_ptr,
+    seq_len: tl.constexpr, num_heads: tl.constexpr, head_dim: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr
+):
+    # Compute indices
+    pid = tl.program_id(0)
+    num_pid_m = tl.cdiv(seq_len, BLOCK_SIZE)
+    num_pid_n = tl.cdiv(seq_len, BLOCK_SIZE)
+    num_pid_in_group = pid % num_pid_n
+    group_id = pid // num_pid_n
+    
+    # Compute offsets
+    start_m = group_id * BLOCK_SIZE
+    start_n = num_pid_in_group * BLOCK_SIZE
+    
+    # Create pointers
+    query_ptr = query_ptr + start_m * head_dim
+    key_ptr = key_ptr + start_n * head_dim
+    out_ptr = out_ptr + start_m * seq_len + start_n
+    
+    # Initialize accumulator
+    acc = tl.zeros((BLOCK_SIZE, BLOCK_SIZE), dtype=tl.float32)
+    
+    # Iterate over head dimension
+    for k in range(0, head_dim, BLOCK_SIZE):
+        # Load query and key
+        q = tl.load(query_ptr + tl.arange(0, BLOCK_SIZE)[:, None] * head_dim + tl.arange(0, BLOCK_SIZE)[None, :] + k,
+                    mask=(tl.arange(0, BLOCK_SIZE)[:, None] < BLOCK_SIZE) & (tl.arange(0, BLOCK_SIZE)[None, :] + k < head_dim) & (tl.arange(0, BLOCK_SIZE)[:, None] + start_m < seq_len),
+                    other=0.0)
+        k = tl.load(key_ptr + tl.arange(0, BLOCK_SIZE)[:, None] * head_dim + tl.arange(0, BLOCK_SIZE)[None, :] + k,
+                    mask=(tl.arange(0, BLOCK_SIZE)[:, None] < BLOCK_SIZE) & (tl.arange(0, BLOCK_SIZE)[None, :] + k < head_dim) & (tl.arange(0, BLOCK_SIZE)[:, None] + start_n < seq_len),
+                    other=0.0)
+        
+        # Perform matrix multiplication
+        acc += tl.dot(q, tl.trans(k))
+    
+    # Store output
+    tl.store(out_ptr + tl.arange(0, BLOCK_SIZE)[:, None] * seq_len + tl.arange(0, BLOCK_SIZE)[None, :],
+             acc, mask=(tl.arange(0, BLOCK_SIZE)[:, None] + start_m < seq_len) & (tl.arange(0, BLOCK_SIZE)[None, :] + start_n < seq_len))
 
 
 class LlamaAttention(nn.Module):
@@ -967,16 +993,25 @@ class LlamaAttention(nn.Module):
 
         past_key_value = (key_states, value_states) if use_cache else None
 
-        # Triton kernel for computing attention weights
+        # Compute attention weights
+        BLOCK_SIZE = 128  # Adjust this for performance
+        grid = (
+            triton.cdiv(q_len, BLOCK_SIZE) * triton.cdiv(q_len, BLOCK_SIZE),
+        )
+
         attn_weights = torch.empty((bsz, self.num_heads, q_len, kv_seq_len), device=hidden_states.device, dtype=hidden_states.dtype)
 
-        attn_weights_kernel[grid](
-            query_states,
-            key_states,
-            attn_weights,
-            self.head_dim,
-            BLOCK_SIZE
-        )
+        for i in range(bsz):
+            for j in range(self.num_heads):
+                attn_weights_kernel[grid](
+                    query_states[i, j],
+                    key_states[i, j % self.num_key_value_heads],
+                    attn_weights[i, j],
+                    q_len,
+                    self.num_heads,
+                    self.head_dim,
+                    BLOCK_SIZE
+                )
 
         attn_weights = attn_weights / math.sqrt(self.head_dim)
 
