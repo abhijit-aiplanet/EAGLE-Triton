@@ -801,30 +801,36 @@ def attn_weights_kernel(
     start_n = num_pid_in_group * BLOCK_SIZE
     
     # Create pointers
-    query_ptr = query_ptr + start_m * head_dim
-    key_ptr = key_ptr + start_n * head_dim
-    out_ptr = out_ptr + start_m * seq_len + start_n
+    query_start = query_ptr + start_m * head_dim
+    key_start = key_ptr + start_n * head_dim
+    out_start = out_ptr + start_m * seq_len + start_n
     
     # Initialize accumulator
     acc = tl.zeros((BLOCK_SIZE, BLOCK_SIZE), dtype=tl.float32)
     
     # Iterate over head dimension
-    for k in range(0, head_dim, BLOCK_SIZE):
+    for k_idx in range(0, tl.cdiv(head_dim, BLOCK_SIZE)):
+        k_start = k_idx * BLOCK_SIZE
+        
         # Load query and key
-        q = tl.load(query_ptr + tl.arange(0, BLOCK_SIZE)[:, None] * head_dim + tl.arange(0, BLOCK_SIZE)[None, :] + k,
-                    mask=(tl.arange(0, BLOCK_SIZE)[:, None] < BLOCK_SIZE) & (tl.arange(0, BLOCK_SIZE)[None, :] + k < head_dim) & (tl.arange(0, BLOCK_SIZE)[:, None] + start_m < seq_len),
+        q = tl.load(query_start + tl.arange(0, BLOCK_SIZE)[:, None] * head_dim + tl.arange(k_start, k_start + BLOCK_SIZE)[None, :],
+                    mask=(tl.arange(0, BLOCK_SIZE)[:, None] < BLOCK_SIZE) & 
+                         (tl.arange(k_start, k_start + BLOCK_SIZE)[None, :] < head_dim) & 
+                         (tl.arange(0, BLOCK_SIZE)[:, None] + start_m < seq_len),
                     other=0.0)
-        k = tl.load(key_ptr + tl.arange(0, BLOCK_SIZE)[:, None] * head_dim + tl.arange(0, BLOCK_SIZE)[None, :] + k,
-                    mask=(tl.arange(0, BLOCK_SIZE)[:, None] < BLOCK_SIZE) & (tl.arange(0, BLOCK_SIZE)[None, :] + k < head_dim) & (tl.arange(0, BLOCK_SIZE)[:, None] + start_n < seq_len),
+        k = tl.load(key_start + tl.arange(0, BLOCK_SIZE)[:, None] * head_dim + tl.arange(k_start, k_start + BLOCK_SIZE)[None, :],
+                    mask=(tl.arange(0, BLOCK_SIZE)[:, None] < BLOCK_SIZE) & 
+                         (tl.arange(k_start, k_start + BLOCK_SIZE)[None, :] < head_dim) & 
+                         (tl.arange(0, BLOCK_SIZE)[:, None] + start_n < seq_len),
                     other=0.0)
         
         # Perform matrix multiplication
         acc += tl.dot(q, tl.trans(k))
     
     # Store output
-    tl.store(out_ptr + tl.arange(0, BLOCK_SIZE)[:, None] * seq_len + tl.arange(0, BLOCK_SIZE)[None, :],
-             acc, mask=(tl.arange(0, BLOCK_SIZE)[:, None] + start_m < seq_len) & (tl.arange(0, BLOCK_SIZE)[None, :] + start_n < seq_len))
-
+    tl.store(out_start + tl.arange(0, BLOCK_SIZE)[:, None] * seq_len + tl.arange(0, BLOCK_SIZE)[None, :],
+             acc, mask=(tl.arange(0, BLOCK_SIZE)[:, None] + start_m < seq_len) & 
+                       (tl.arange(0, BLOCK_SIZE)[None, :] + start_n < seq_len))
 
 class LlamaAttention(nn.Module):
     """
