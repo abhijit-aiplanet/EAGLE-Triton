@@ -735,31 +735,34 @@ def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
 
 
 @triton.jit
-def linear_proj_kernel(x_ptr, weight_ptr, out_ptr, in_features: tl.constexpr, out_features: tl.constexpr, BLOCK_SIZE: tl.constexpr):
+def linear_proj_kernel(
+    x_ptr, weight_ptr, out_ptr,
+    in_features: tl.constexpr, out_features, BLOCK_SIZE: tl.constexpr
+):
     seq_idx = tl.program_id(0)  # Sequence index
     dim_idx = tl.arange(0, BLOCK_SIZE)  # Block of dimensions for parallelism
     
-    # Load input tensor (1D slice corresponding to a single sequence)
-    x_val = tl.load(x_ptr + seq_idx * in_features + dim_idx, mask=dim_idx < in_features, other=0.0)
+    # Load input tensor (1D slice corresponding to a single sequence, reshape to 2D)
+    x_val = tl.load(x_ptr + seq_idx * in_features + dim_idx, mask=dim_idx < in_features)
     
-    # Initialize the output result (result will have 1 row and out_features columns)
-    result = tl.zeros([BLOCK_SIZE], dtype=tl.float32)
+    # Reshape x_val into a 2D matrix (1 row by in_features columns)
+    x_val = tl.reshape(x_val, (1, in_features))
+    
+    # Initialize the output result
+    result = tl.zeros([1, out_features], dtype=tl.float32)
     
     # Perform matrix multiplication
-    for i in range(0, out_features, BLOCK_SIZE):  # Iterate over output features in blocks
-        # Load weight slice (reshaped to 2D with in_features rows)
-        weight = tl.load(weight_ptr + i * in_features + dim_idx, mask=dim_idx < in_features, other=0.0)
+    for i in range(0, out_features, BLOCK_SIZE):
+        # Iterate over output features in blocks
+        # Load weight slice (reshaped to be 2D with in_features rows)
+        weight = tl.load(weight_ptr + i * in_features + dim_idx, mask=dim_idx < in_features)
+        weight = tl.reshape(weight, (in_features, BLOCK_SIZE))
         
-        if in_features < 16 or out_features < 16:
-            # Fallback: Perform dot product manually for small sizes
-            result += x_val * weight  # element-wise multiplication as fallback
-        else:
-            # Use Triton's tl.dot for larger matrices
-            result += tl.dot(x_val[None, :], weight[:, None]).flatten()
+        # Perform matrix multiplication (dot product between x_val and weight)
+        result += tl.dot(x_val, weight)
     
     # Store the result in the output tensor
     tl.store(out_ptr + seq_idx * out_features + dim_idx, result, mask=dim_idx < out_features)
-
 
 
 # Triton kernel for attention weights calculation (query * key^T)
