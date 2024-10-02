@@ -739,31 +739,40 @@ def linear_proj_kernel(
     x_ptr, weight_ptr, out_ptr,
     in_features: tl.constexpr, out_features: tl.constexpr, BLOCK_SIZE: tl.constexpr
 ):
-    seq_idx = tl.program_id(0)  # Sequence index
+    # Compute sequence index and offset
+    seq_idx = tl.program_id(0)
+    offset = tl.program_id(1) * BLOCK_SIZE
+    
+    # Create a range for the current block
+    block_range = tl.arange(0, BLOCK_SIZE)
     
     # Load input tensor (entire row)
-    x_val = tl.load(x_ptr + seq_idx * in_features + tl.arange(0, in_features))
+    x_val = tl.load(x_ptr + seq_idx * in_features + block_range, mask=block_range < in_features)
     
-    # No need to reshape x_val, it's already 1D
+    # Initialize the output result for this block
+    block_result = tl.zeros([BLOCK_SIZE], dtype=tl.float32)
     
-    # Initialize the output result
-    result = tl.zeros([out_features], dtype=tl.float32)
-    
-    # Perform matrix multiplication
-    for i in range(0, out_features, BLOCK_SIZE):
-        # Compute current output block size
-        current_block_size = min(BLOCK_SIZE, out_features - i)
-        # Load weight slice
-        weight = tl.load(
-            weight_ptr + i * in_features + tl.arange(0, in_features)[:, None] * out_features + tl.arange(0, current_block_size)[None, :],
-            mask=tl.arange(0, current_block_size)[None, :] < (out_features - i)
+    # Perform matrix multiplication for this block
+    for i in range(0, in_features, BLOCK_SIZE):
+        # Load a block of the weight matrix
+        weight_block = tl.load(
+            weight_ptr + i * out_features + offset + block_range[:, None] * out_features + block_range[None, :],
+            mask=(block_range[:, None] < BLOCK_SIZE) & (block_range[None, :] < BLOCK_SIZE) & 
+                 (i + block_range[:, None] < in_features) & (offset + block_range[None, :] < out_features)
         )
         
-        # Perform matrix multiplication (dot product between x_val and weight)
-        result[i:i+current_block_size] += tl.dot(x_val, weight)
+        # Load the corresponding block of x_val
+        x_block = tl.load(x_ptr + seq_idx * in_features + i + block_range, mask=i + block_range < in_features)
+        
+        # Perform matrix multiplication for this sub-block
+        block_result += tl.dot(x_block[:, None], weight_block)
     
     # Store the result in the output tensor
-    tl.store(out_ptr + seq_idx * out_features + tl.arange(0, out_features), result)
+    tl.store(
+        out_ptr + seq_idx * out_features + offset + block_range, 
+        block_result, 
+        mask=offset + block_range < out_features
+    )
 
 
 # Triton kernel for attention weights calculation (query * key^T)
@@ -891,8 +900,11 @@ class LlamaAttention(nn.Module):
 
         else:
             # Apply Triton kernel for linear projections
-            BLOCK_SIZE = 1024  # Adjust this for performance
-            grid = lambda meta: (hidden_states.size(0),)  # Parallelize over batch size
+            BLOCK_SIZE = 128  # Adjust this for performance
+            grid = (
+                bsz,
+                triton.cdiv(self.num_heads * self.head_dim, BLOCK_SIZE)
+            )
 
             query_states = torch.empty((bsz, q_len, self.num_heads * self.head_dim), device=hidden_states.device, dtype=hidden_states.dtype)
             key_states = torch.empty((bsz, q_len, self.num_key_value_heads * self.head_dim), device=hidden_states.device, dtype=hidden_states.dtype)
@@ -900,7 +912,7 @@ class LlamaAttention(nn.Module):
 
             linear_proj_kernel[grid](
                 hidden_states,
-                self.q_proj.weight,
+                self.q_proj.weight.T,
                 query_states,
                 self.hidden_size,
                 self.num_heads * self.head_dim,
@@ -909,7 +921,7 @@ class LlamaAttention(nn.Module):
 
             linear_proj_kernel[grid](
                 hidden_states,
-                self.k_proj.weight,
+                self.k_proj.weight.T,
                 key_states,
                 self.hidden_size,
                 self.num_key_value_heads * self.head_dim,
@@ -918,7 +930,7 @@ class LlamaAttention(nn.Module):
 
             linear_proj_kernel[grid](
                 hidden_states,
-                self.v_proj.weight,
+                self.v_proj.weight.T,
                 value_states,
                 self.hidden_size,
                 self.num_key_value_heads * self.head_dim,
@@ -930,7 +942,6 @@ class LlamaAttention(nn.Module):
         key_states = key_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
         value_states = value_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
 
-        # Compute rotary positional embeddings
         kv_seq_len = key_states.shape[-2]
         if past_key_value is not None:
             kv_seq_len += past_key_value[0].shape[-2]
@@ -938,6 +949,13 @@ class LlamaAttention(nn.Module):
         query_states, key_states = apply_rotary_pos_emb(
             query_states, key_states, cos, sin, position_ids
         )
+
+        if past_key_value is not None:
+            # reuse k, v, self_attention
+            key_states = torch.cat([past_key_value[0], key_states], dim=2)
+            value_states = torch.cat([past_key_value[1], value_states], dim=2)
+
+        past_key_value = (key_states, value_states) if use_cache else None
 
         # Triton kernel for computing attention weights
         attn_weights = torch.empty((bsz, self.num_heads, q_len, kv_seq_len), device=hidden_states.device, dtype=hidden_states.dtype)
@@ -953,11 +971,10 @@ class LlamaAttention(nn.Module):
         attn_weights = attn_weights / math.sqrt(self.head_dim)
 
         if attention_mask is not None:
-            attn_weights += attention_mask
-
-        attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
+            attn_weights = attn_weights + attention_mask
 
         # Compute attention output
+        attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
         attn_output = torch.matmul(attn_weights, value_states)
 
         attn_output = attn_output.transpose(1, 2).contiguous().view(bsz, q_len, self.hidden_size)
@@ -969,7 +986,6 @@ class LlamaAttention(nn.Module):
             attn_weights = None
 
         return attn_output, attn_weights, past_key_value
-
 
 # Triton kernel for layer normalization
 @triton.jit
