@@ -814,15 +814,17 @@ def attn_weights_kernel(
     
     # Iterate over head dimension
     for k in range(0, head_dim, BLOCK_SIZE):
+        k_block = tl.minimum(BLOCK_SIZE, head_dim - k)
+        
         # Load query and key
-        q = tl.load(query_start + range_blocks[:, None] * head_dim + range_head_dim[None, :] + k,
+        q = tl.load(query_start + range_blocks[:, None] * head_dim + range_head_dim[None, :k_block] + k,
                     mask=(range_blocks[:, None] < BLOCK_SIZE) & 
-                         (range_head_dim[None, :] + k < head_dim) & 
+                         (range_head_dim[None, :k_block] + k < head_dim) & 
                          (range_blocks[:, None] + start_m < seq_len),
                     other=0.0)
-        k = tl.load(key_start + range_blocks[:, None] * head_dim + range_head_dim[None, :] + k,
+        k = tl.load(key_start + range_blocks[:, None] * head_dim + range_head_dim[None, :k_block] + k,
                     mask=(range_blocks[:, None] < BLOCK_SIZE) & 
-                         (range_head_dim[None, :] + k < head_dim) & 
+                         (range_head_dim[None, :k_block] + k < head_dim) & 
                          (range_blocks[:, None] + start_n < seq_len),
                     other=0.0)
         
