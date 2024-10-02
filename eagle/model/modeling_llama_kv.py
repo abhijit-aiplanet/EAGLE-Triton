@@ -737,32 +737,34 @@ def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
 @triton.jit
 def linear_proj_kernel(
     x_ptr, weight_ptr, out_ptr,
-    in_features: tl.constexpr, out_features, BLOCK_SIZE: tl.constexpr
+    in_features: tl.constexpr, out_features: tl.constexpr, BLOCK_SIZE: tl.constexpr
 ):
     seq_idx = tl.program_id(0)  # Sequence index
-    dim_idx = tl.arange(0, BLOCK_SIZE)  # Block of dimensions for parallelism
     
-    # Load input tensor (1D slice corresponding to a single sequence, reshape to 2D)
-    x_val = tl.load(x_ptr + seq_idx * in_features + dim_idx, mask=dim_idx < in_features)
+    # Load input tensor (entire row)
+    x_val = tl.load(x_ptr + seq_idx * in_features + tl.arange(0, in_features))
     
-    # Reshape x_val into a 2D matrix (1 row by in_features columns)
-    x_val = tl.reshape(x_val, (1, in_features))
+    # No need to reshape x_val, it's already 1D
     
     # Initialize the output result
-    result = tl.zeros([1, out_features], dtype=tl.float32)
+    result = tl.zeros([out_features], dtype=tl.float32)
     
     # Perform matrix multiplication
     for i in range(0, out_features, BLOCK_SIZE):
-        # Iterate over output features in blocks
-        # Load weight slice (reshaped to be 2D with in_features rows)
-        weight = tl.load(weight_ptr + i * in_features + dim_idx, mask=dim_idx < in_features)
-        weight = tl.reshape(weight, (in_features, BLOCK_SIZE))
+        # Compute current output block size
+        current_block_size = min(BLOCK_SIZE, out_features - i)
+        
+        # Load weight slice
+        weight = tl.load(
+            weight_ptr + i * in_features + tl.arange(0, in_features)[:, None] * out_features + tl.arange(0, current_block_size)[None, :],
+            mask=tl.arange(0, current_block_size)[None, :] < (out_features - i)
+        )
         
         # Perform matrix multiplication (dot product between x_val and weight)
-        result += tl.dot(x_val, weight)
+        result[i:i+current_block_size] += tl.dot(x_val, weight)
     
     # Store the result in the output tensor
-    tl.store(out_ptr + seq_idx * out_features + dim_idx, result, mask=dim_idx < out_features)
+    tl.store(out_ptr + seq_idx * out_features + tl.arange(0, out_features), result)
 
 
 # Triton kernel for attention weights calculation (query * key^T)
