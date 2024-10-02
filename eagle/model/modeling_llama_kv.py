@@ -737,42 +737,44 @@ def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
 @triton.jit
 def linear_proj_kernel(
     x_ptr, weight_ptr, out_ptr,
-    in_features: tl.constexpr, out_features: tl.constexpr, BLOCK_SIZE: tl.constexpr
+    in_features: tl.constexpr, out_features: tl.constexpr, 
+    seq_len: tl.constexpr, BLOCK_SIZE: tl.constexpr
 ):
-    # Compute sequence index and offset
-    seq_idx = tl.program_id(0)
-    offset = tl.program_id(1) * BLOCK_SIZE
+    # Compute indices
+    pid = tl.program_id(0)
+    num_pid_m = tl.cdiv(seq_len, BLOCK_SIZE)
+    num_pid_n = tl.cdiv(out_features, BLOCK_SIZE)
+    num_pid_in_group = pid % num_pid_n
+    group_id = pid // num_pid_n
     
-    # Create a range for the current block
-    block_range = tl.arange(0, BLOCK_SIZE)
+    # Compute offsets
+    start_m = group_id * BLOCK_SIZE
+    start_n = num_pid_in_group * BLOCK_SIZE
     
-    # Load input tensor (entire row)
-    x_val = tl.load(x_ptr + seq_idx * in_features + block_range, mask=block_range < in_features)
+    # Create pointers
+    x_ptr = x_ptr + start_m * in_features
+    weight_ptr = weight_ptr + start_n
+    out_ptr = out_ptr + start_m * out_features + start_n
     
-    # Initialize the output result for this block
-    block_result = tl.zeros([BLOCK_SIZE], dtype=tl.float32)
+    # Initialize accumulator
+    acc = tl.zeros((BLOCK_SIZE, BLOCK_SIZE), dtype=tl.float32)
     
-    # Perform matrix multiplication for this block
-    for i in range(0, in_features, BLOCK_SIZE):
-        # Load a block of the weight matrix
-        weight_block = tl.load(
-            weight_ptr + i * out_features + offset + block_range[:, None] * out_features + block_range[None, :],
-            mask=(block_range[:, None] < BLOCK_SIZE) & (block_range[None, :] < BLOCK_SIZE) & 
-                 (i + block_range[:, None] < in_features) & (offset + block_range[None, :] < out_features)
-        )
+    # Iterate over input features
+    for k in range(0, in_features, BLOCK_SIZE):
+        # Load x and weight
+        x = tl.load(x_ptr + tl.arange(0, BLOCK_SIZE)[:, None] * in_features + tl.arange(0, BLOCK_SIZE)[None, :] + k,
+                    mask=(tl.arange(0, BLOCK_SIZE)[:, None] < BLOCK_SIZE) & (tl.arange(0, BLOCK_SIZE)[None, :] + k < in_features) & (tl.arange(0, BLOCK_SIZE)[:, None] + start_m < seq_len),
+                    other=0.0)
+        w = tl.load(weight_ptr + tl.arange(0, BLOCK_SIZE)[:, None] * out_features + tl.arange(0, BLOCK_SIZE)[None, :] * in_features + k,
+                    mask=(tl.arange(0, BLOCK_SIZE)[:, None] < BLOCK_SIZE) & (tl.arange(0, BLOCK_SIZE)[None, :] + start_n < out_features),
+                    other=0.0)
         
-        # Load the corresponding block of x_val
-        x_block = tl.load(x_ptr + seq_idx * in_features + i + block_range, mask=i + block_range < in_features)
-        
-        # Perform matrix multiplication for this sub-block
-        block_result += tl.dot(x_block[:, None], weight_block)
+        # Perform matrix multiplication
+        acc += tl.dot(x, w)
     
-    # Store the result in the output tensor
-    tl.store(
-        out_ptr + seq_idx * out_features + offset + block_range, 
-        block_result, 
-        mask=offset + block_range < out_features
-    )
+    # Store output
+    tl.store(out_ptr + tl.arange(0, BLOCK_SIZE)[:, None] * out_features + tl.arange(0, BLOCK_SIZE)[None, :],
+             acc, mask=(tl.arange(0, BLOCK_SIZE)[:, None] + start_m < seq_len) & (tl.arange(0, BLOCK_SIZE)[None, :] + start_n < out_features))
 
 
 # Triton kernel for attention weights calculation (query * key^T)
@@ -902,40 +904,43 @@ class LlamaAttention(nn.Module):
             # Apply Triton kernel for linear projections
             BLOCK_SIZE = 128  # Adjust this for performance
             grid = (
-                bsz,
-                triton.cdiv(self.num_heads * self.head_dim, BLOCK_SIZE)
+                triton.cdiv(q_len, BLOCK_SIZE) * triton.cdiv(self.num_heads * self.head_dim, BLOCK_SIZE),
             )
 
             query_states = torch.empty((bsz, q_len, self.num_heads * self.head_dim), device=hidden_states.device, dtype=hidden_states.dtype)
             key_states = torch.empty((bsz, q_len, self.num_key_value_heads * self.head_dim), device=hidden_states.device, dtype=hidden_states.dtype)
             value_states = torch.empty((bsz, q_len, self.num_key_value_heads * self.head_dim), device=hidden_states.device, dtype=hidden_states.dtype)
 
-            linear_proj_kernel[grid](
-                hidden_states,
-                self.q_proj.weight.T,
-                query_states,
-                self.hidden_size,
-                self.num_heads * self.head_dim,
-                BLOCK_SIZE
-            )
+            for i in range(bsz):
+                linear_proj_kernel[grid](
+                    hidden_states[i],
+                    self.q_proj.weight,
+                    query_states[i],
+                    self.hidden_size,
+                    self.num_heads * self.head_dim,
+                    q_len,
+                    BLOCK_SIZE
+                )
 
-            linear_proj_kernel[grid](
-                hidden_states,
-                self.k_proj.weight.T,
-                key_states,
-                self.hidden_size,
-                self.num_key_value_heads * self.head_dim,
-                BLOCK_SIZE
-            )
+                linear_proj_kernel[grid](
+                    hidden_states[i],
+                    self.k_proj.weight,
+                    key_states[i],
+                    self.hidden_size,
+                    self.num_key_value_heads * self.head_dim,
+                    q_len,
+                    BLOCK_SIZE
+                )
 
-            linear_proj_kernel[grid](
-                hidden_states,
-                self.v_proj.weight.T,
-                value_states,
-                self.hidden_size,
-                self.num_key_value_heads * self.head_dim,
-                BLOCK_SIZE
-            )
+                linear_proj_kernel[grid](
+                    hidden_states[i],
+                    self.v_proj.weight,
+                    value_states[i],
+                    self.hidden_size,
+                    self.num_key_value_heads * self.head_dim,
+                    q_len,
+                    BLOCK_SIZE
+                )
 
         # Reshape query, key, and value tensors
         query_states = query_states.view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
